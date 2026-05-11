@@ -3,9 +3,11 @@
 The descriptor wire format is V3 ``Schema.get_v1_info()`` verbatim, so
 per-input dicts are handed straight to V3's IO classes without
 reinterpretation. ``_parse_input_spec`` knows STRING / INT / FLOAT /
-BOOLEAN / COMBO / IMAGE / VIDEO / AUDIO / MASK; an input outside that
-set causes the whole node to be skipped with a warning rather than
-half-built.
+BOOLEAN / COMBO / IMAGE / VIDEO / AUDIO / MASK natively; any other
+``io_type`` string is treated as an opaque pass-through socket (see
+``IO.Custom``) so partner-defined types like ``RECRAFT_STYLE_V3`` /
+``RECRAFT_COLOR`` round-trip between RNP nodes without the descriptor
+being rejected.
 
 Hidden inputs (``auth_token_comfy_org`` / ``api_key_comfy_org`` /
 ``unique_id`` / ``prompt`` / ``extra_pnginfo`` / ``dynprompt``) are
@@ -306,6 +308,16 @@ def build_node_class(
     url_fetch_policy = (
         remote.get("url_fetch") if isinstance(remote.get("url_fetch"), dict) else {}
     )
+    # ``descriptor.remote.hidden_forwarded`` opt-in for non-auth hidden
+    # markers (``prompt`` / ``extra_pnginfo`` / ``dynprompt``). Auth
+    # tokens and ``unique_id`` always forward when declared. Anything
+    # else is declared on the schema (so the executor populates
+    # ``cls.hidden``) but dropped before building the request body so
+    # large EXTRA_PNGINFO blobs don't ship by default.
+    hidden_forwarded_raw = remote.get("hidden_forwarded") or []
+    hidden_forwarded: list[str] = [
+        h for h in hidden_forwarded_raw if isinstance(h, str)
+    ] if isinstance(hidden_forwarded_raw, (list, tuple)) else []
 
     display_name = descriptor.get("display_name") or node_id
     category = descriptor.get("category") or "remote"
@@ -364,6 +376,7 @@ def build_node_class(
                 timeout_s=timeout_s,
                 outputs_meta=schema_outputs,
                 hidden_names=hidden_names,
+                hidden_forwarded=hidden_forwarded,
                 inputs=kwargs,
                 max_inline_bytes=max_inline_bytes,
                 estimated_duration_s=estimated_duration_s,
@@ -439,13 +452,17 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
     if isinstance(io_type, list):
         # Legacy V1-style combo: io_type *is* the options list.
         return IO.Combo.Input(name, options=list(io_type),
-                              default=options.get("default"), **common)
+                              default=options.get("default"),
+                              control_after_generate=options.get("control_after_generate"),
+                              **common)
     if io_type == "COMBO":
         opts = options.get("options")
         if not isinstance(opts, (list, tuple)):
             return None
         return IO.Combo.Input(name, options=list(opts),
-                              default=options.get("default"), **common)
+                              default=options.get("default"),
+                              control_after_generate=options.get("control_after_generate"),
+                              **common)
     if io_type == "STRING":
         return IO.String.Input(
             name,
@@ -460,6 +477,7 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
             min=options.get("min", 0),
             max=options.get("max", 2147483647),
             step=options.get("step", 1),
+            control_after_generate=options.get("control_after_generate"),
             **common,
         )
     if io_type == "FLOAT":
@@ -483,6 +501,12 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
         return IO.Audio.Input(name, **common)
     if io_type == "MASK":
         return IO.Mask.Input(name, **common)
+    # Any other string io_type — partner-defined custom IO (RecraftStyle,
+    # RecraftColor, Tripo3DModel, …). Built as an opaque pass-through
+    # socket so the descriptor is accepted; the value flows between RNP
+    # nodes verbatim and the proxy_node never inspects or serialises it.
+    if isinstance(io_type, str) and io_type:
+        return IO.Custom(io_type).Input(name, **common)
     return None
 
 
@@ -567,10 +591,18 @@ def _parse_outputs(descriptor: dict[str, Any]) -> list[Any] | None:
         tip = output_tooltips[i] if i < len(output_tooltips) else None
         cls = _OUTPUT_CLASSES.get(io_type)
         if cls is None:
-            log.warning(
-                "Skipping descriptor: unsupported output type %r", io_type,
-            )
-            return None
+            # Partner-defined custom IO output (RecraftStyle, Tripo3DModel,
+            # Hunyuan3DMesh, …). Built as an opaque pass-through socket so
+            # the value flows downstream verbatim — no envelope decoding.
+            if not isinstance(io_type, str) or not io_type:
+                log.warning(
+                    "Skipping descriptor: unsupported output type %r", io_type,
+                )
+                return None
+            out.append(IO.Custom(io_type).Output(
+                display_name=name, is_output_list=is_list, tooltip=tip,
+            ))
+            continue
         out.append(cls(display_name=name, is_output_list=is_list, tooltip=tip))
     return out
 
@@ -825,6 +857,7 @@ async def _execute_remote(
     timeout_s: float,
     outputs_meta: list[Any],
     hidden_names: list[str],
+    hidden_forwarded: list[str],
     inputs: dict[str, Any],
     max_inline_bytes: int | None = None,
     estimated_duration_s: int | float | None = None,
@@ -837,7 +870,15 @@ async def _execute_remote(
     # Strip hidden inputs from the user-supplied kwargs. Auth credentials
     # (``auth_token_comfy_org`` / ``api_key_comfy_org``) travel as standard
     # HTTP headers so the server can forward them to api.comfy.org without
-    # parsing the body; everything else rides in the request ``context``.
+    # parsing the body; ``unique_id`` always rides in ``context`` for
+    # correlation. Other markers (``prompt`` / ``extra_pnginfo`` /
+    # ``dynprompt``) only forward when the descriptor explicitly opted
+    # in via ``remote.hidden_forwarded`` — otherwise they're declared on
+    # the schema (so the executor populates ``cls.hidden``) but stripped
+    # before we build the request body, so EXTRA_PNGINFO blobs don't
+    # leak by default.
+    _ALWAYS_FORWARD = {"auth_token_comfy_org", "api_key_comfy_org", "unique_id"}
+    forward_set = _ALWAYS_FORWARD | set(hidden_forwarded)
     context: dict[str, Any] = {}
     auth_headers: dict[str, str] = {}
     hidden_holder = getattr(cls, "hidden", None)
@@ -858,7 +899,7 @@ async def _execute_remote(
             auth_headers["Authorization"] = f"Bearer {value}"
         elif hname == "api_key_comfy_org":
             auth_headers["X-API-KEY"] = str(value)
-        else:
+        elif hname in forward_set:
             context[hname] = value
 
     # Encode heavy-typed inputs (IMAGE/MASK/AUDIO) as RNP value
