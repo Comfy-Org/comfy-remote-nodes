@@ -277,23 +277,30 @@ def decode_svg_envelope(envelope: dict[str, Any]) -> Any:
 
     raw = decode_envelope_data(envelope)
     text = raw.decode("utf-8", "replace")
-    # Split per-frame on the closing tag; preserve the tag on the
-    # preceding chunk so each frame remains a complete SVG document.
-    closing = "</svg>"
+    # The server joins per-frame SVGs with ``\n`` (see
+    # ``_emit_svg_from_urls``); split on the closing tag followed by a
+    # newline so an SVG document that legitimately contains ``</svg>``
+    # in CDATA / a foreignObject / a comment isn't shredded mid-frame.
+    # Fall back to splitting on the bare closing tag for single-frame
+    # payloads or older server builds that didn't add the newline.
+    delimiter = "</svg>\n"
+    if delimiter not in text:
+        delimiter = "</svg>"
     parts: list[BytesIO] = []
     cursor = 0
+    closing = "</svg>"
     while True:
-        idx = text.find(closing, cursor)
+        idx = text.find(delimiter, cursor)
         if idx < 0:
             tail = text[cursor:].strip()
             if tail:
                 parts.append(BytesIO(tail.encode("utf-8")))
             break
-        end = idx + len(closing)
+        end = idx + len(closing)  # keep the closing tag on this frame
         chunk = text[cursor:end].strip()
         if chunk:
             parts.append(BytesIO(chunk.encode("utf-8")))
-        cursor = end
+        cursor = idx + len(delimiter)
     declared = envelope.get("count")
     if isinstance(declared, int) and declared > 0 and declared != len(parts):
         log.warning(

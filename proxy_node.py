@@ -518,20 +518,32 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
         # the executor packs the connected ones into a dict keyed by
         # virtual id which the server provider iterates.
         template_spec = options.get("template")
-        if not isinstance(template_spec, (list, tuple)) or not template_spec:
+        if (
+            not isinstance(template_spec, (list, tuple))
+            or len(template_spec) < 1
+            or not isinstance(template_spec[0], str)
+        ):
+            log.warning(
+                "AUTOGROW input %s: malformed template spec %r",
+                name, template_spec,
+            )
             return None
         # The template is itself an ``[io_type, {...}]`` pair — reuse
         # the parser recursively so AUTOGROW inherits every IO type the
         # parser knows about (IMAGE, MASK, STRING, custom IO …).
-        # ``optional`` on the template controls the per-slot
-        # optional-ness inside ``IO.Autogrow.TemplatePrefix``: the
-        # template input is always built with optional=False so the
-        # frontend treats min slots as required, and ``min``/``max``
-        # govern the visible-vs-required boundary.
+        # The framework forbids ``DynamicInput`` as an Autogrow template
+        # (``assert(not isinstance(input, DynamicInput))`` in
+        # ``_AutogrowTemplate.__init__``), so passing AUTOGROW or
+        # DYNAMIC_COMBO here will raise inside ``TemplatePrefix`` —
+        # caught below.
         template_input = _parse_input_spec(
             "_autogrow_template", list(template_spec), optional=False,
         )
         if template_input is None:
+            log.warning(
+                "AUTOGROW input %s: failed to parse template %r",
+                name, template_spec,
+            )
             return None
         prefix = options.get("prefix")
         if not isinstance(prefix, str) or not prefix:
@@ -1308,16 +1320,37 @@ async def _encode_inputs(
     return out
 
 
+def _dict_contains_tensor(value: Any) -> bool:
+    """True iff a dict (or nested dict) holds at least one torch tensor.
+
+    Used to gate the recursive encode branch so we don't pointlessly
+    rebuild scalar custom-IO chain dicts (RECRAFT_V3_STYLE etc.) on
+    every encode pass, and so already-encoded envelope dicts pass
+    straight through. Nested-dict support keeps DynamicCombo→Autogrow
+    composition (and any future layered dynamic IO) round-trippable.
+    """
+    if isinstance(value, dict):
+        return any(_dict_contains_tensor(v) for v in value.values())
+    return serialization._is_torch_tensor(value)
+
+
 def _encode_one(name: str, value: Any) -> Any:
     if serialization.is_audio_input(value):
         return serialization.encode_audio_input(value)
-    if isinstance(value, dict) and not serialization.is_audio_input(value):
+    if (
+        isinstance(value, dict)
+        and not serialization.is_envelope(value)
+        and not serialization.is_audio_input(value)
+        and _dict_contains_tensor(value)
+    ):
         # IO.Autogrow inputs arrive grouped as a dict (e.g. ``{"image0":
         # tensor, "image1": tensor}``) keyed by the per-slot virtual id.
-        # Recursively encode each value so the heavy-typed members
-        # turn into envelopes; non-tensor entries pass through. The
-        # server provider then iterates the same dict on the other end
-        # and gathers the envelopes via ``inputs[name][slot_id]``.
+        # Nested dynamic types (DynamicCombo whose option inputs include
+        # an Autogrow, etc.) can produce arbitrarily nested dict-of-
+        # tensor shapes — recurse so every heavy-typed leaf becomes an
+        # envelope. Skip ordinary scalar dicts (custom-IO chain values
+        # like RECRAFT_V3_STYLE) and already-encoded envelopes; both
+        # pass through unchanged via the ``return value`` tail.
         encoded_dict: dict[str, Any] = {}
         for sub_name, sub_value in value.items():
             encoded_dict[sub_name] = _encode_one(f"{name}.{sub_name}", sub_value)
