@@ -501,6 +501,114 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
         return IO.Audio.Input(name, **common)
     if io_type == "MASK":
         return IO.Mask.Input(name, **common)
+    if io_type == "SVG":
+        return IO.SVG.Input(name, **common)
+    if io_type == "AUTOGROW":
+        # Wire shape:
+        #   ["AUTOGROW", {
+        #       "template": ["IMAGE", {...}],   # nested input spec
+        #       "prefix":   "image",
+        #       "min":      1,
+        #       "max":      5,
+        #   }]
+        # The descriptor declares N "<prefix>0".."<prefix>{max-1}"
+        # virtual inputs that the V3 frontend renders as a single
+        # auto-growing block — see ``IO.Autogrow.TemplatePrefix``.
+        # The first ``min`` slots are required, the rest optional;
+        # the executor packs the connected ones into a dict keyed by
+        # virtual id which the server provider iterates.
+        template_spec = options.get("template")
+        if not isinstance(template_spec, (list, tuple)) or not template_spec:
+            return None
+        # The template is itself an ``[io_type, {...}]`` pair — reuse
+        # the parser recursively so AUTOGROW inherits every IO type the
+        # parser knows about (IMAGE, MASK, STRING, custom IO …).
+        # ``optional`` on the template controls the per-slot
+        # optional-ness inside ``IO.Autogrow.TemplatePrefix``: the
+        # template input is always built with optional=False so the
+        # frontend treats min slots as required, and ``min``/``max``
+        # govern the visible-vs-required boundary.
+        template_input = _parse_input_spec(
+            "_autogrow_template", list(template_spec), optional=False,
+        )
+        if template_input is None:
+            return None
+        prefix = options.get("prefix")
+        if not isinstance(prefix, str) or not prefix:
+            return None
+        min_slots = int(options.get("min", 1))
+        max_slots = int(options.get("max", 1))
+        if max_slots < 1 or min_slots < 0 or min_slots > max_slots:
+            return None
+        try:
+            template = IO.Autogrow.TemplatePrefix(
+                template_input,
+                prefix=prefix,
+                min=min_slots,
+                max=max_slots,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "AUTOGROW input %s: failed to build TemplatePrefix: %s",
+                name, e,
+            )
+            return None
+        return IO.Autogrow.Input(
+            name,
+            template=template,
+            display_name=options.get("display_name"),
+            optional=optional,
+            tooltip=options.get("tooltip"),
+        )
+    if io_type == "DYNAMIC_COMBO":
+        # Wire shape:
+        #   ["DYNAMIC_COMBO", {
+        #       "options": [
+        #           {"key": "recraftv4",     "inputs": [
+        #               ["size", "COMBO", {"options": [...]}],
+        #               ...
+        #           ]},
+        #           {"key": "recraftv4_pro", "inputs": [...]},
+        #       ],
+        #       "default": "recraftv4",
+        #       "tooltip": "...",
+        #   }]
+        # The selected key drives which sub-widget block the frontend
+        # renders; the executor packs ``{"model": <key>, ...sub fields}``
+        # into a dict the server consumes via
+        # ``inputs["model"]["model"]`` / ``inputs["model"]["size"]``
+        # idiom — same shape ``IO.DynamicCombo`` produces locally.
+        opts = options.get("options")
+        if not isinstance(opts, list) or not opts:
+            return None
+        dc_options: list[Any] = []
+        for entry in opts:
+            if not isinstance(entry, dict):
+                return None
+            key = entry.get("key")
+            sub_inputs_spec = entry.get("inputs")
+            if not isinstance(key, str) or not isinstance(sub_inputs_spec, list):
+                return None
+            sub_inputs: list[Any] = []
+            for sub in sub_inputs_spec:
+                if not (isinstance(sub, (list, tuple)) and len(sub) >= 2 and isinstance(sub[0], str)):
+                    return None
+                sub_name = sub[0]
+                sub_spec = list(sub[1:])
+                # ``[name, io_type, options]`` flattens to the parser's
+                # ``[io_type, options]`` shape with sub_name carried separately.
+                sub_input = _parse_input_spec(sub_name, sub_spec, optional=False)
+                if sub_input is None:
+                    return None
+                sub_inputs.append(sub_input)
+            dc_options.append(IO.DynamicCombo.Option(key, sub_inputs))
+        return IO.DynamicCombo.Input(
+            name,
+            options=dc_options,
+            display_name=options.get("display_name"),
+            optional=optional,
+            tooltip=options.get("tooltip"),
+        )
     # Any other string io_type — partner-defined custom IO (RecraftStyle,
     # RecraftColor, Tripo3DModel, …). Built as an opaque pass-through
     # socket so the descriptor is accepted; the value flows between RNP
@@ -612,6 +720,7 @@ _OUTPUT_CLASSES = {
     "IMAGE":   IO.Image.Output,
     "AUDIO":   IO.Audio.Output,
     "MASK":    IO.Mask.Output,
+    "SVG":     IO.SVG.Output,
     "STRING":  IO.String.Output,
     "INT":     IO.Int.Output,
     "FLOAT":   IO.Float.Output,
@@ -1202,6 +1311,17 @@ async def _encode_inputs(
 def _encode_one(name: str, value: Any) -> Any:
     if serialization.is_audio_input(value):
         return serialization.encode_audio_input(value)
+    if isinstance(value, dict) and not serialization.is_audio_input(value):
+        # IO.Autogrow inputs arrive grouped as a dict (e.g. ``{"image0":
+        # tensor, "image1": tensor}``) keyed by the per-slot virtual id.
+        # Recursively encode each value so the heavy-typed members
+        # turn into envelopes; non-tensor entries pass through. The
+        # server provider then iterates the same dict on the other end
+        # and gathers the envelopes via ``inputs[name][slot_id]``.
+        encoded_dict: dict[str, Any] = {}
+        for sub_name, sub_value in value.items():
+            encoded_dict[sub_name] = _encode_one(f"{name}.{sub_name}", sub_value)
+        return encoded_dict
     if not serialization._is_torch_tensor(value):
         return value
     rank = value.dim()

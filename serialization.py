@@ -253,6 +253,62 @@ def decode_video_envelope(envelope: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# SVG decode (encode lands when a remote node accepts SVG inputs; today
+# Recraft's V3/V4 vector endpoints only emit SVG, so the client is
+# decode-only).
+# ---------------------------------------------------------------------------
+
+def decode_svg_envelope(envelope: dict[str, Any]) -> Any:
+    """Decode an SVG envelope into a ``comfy_extras.nodes_images.SVG`` instance.
+
+    The wire payload is one or more concatenated ``<svg>…</svg>`` XML
+    documents; we split on the closing tag so a multi-frame Recraft
+    response (n>1) hydrates a single ``SVG`` carrying a list of
+    BytesIO frames — the same shape the local node produces via
+    ``SVG(svg_data)``.
+    """
+    encoding = envelope.get("encoding")
+    if encoding not in ("svg_xml_base64", "svg_xml_inline"):
+        raise RnpProtocolError(
+            f"Unsupported svg encoding: {encoding!r}",
+            code=ErrorCode.INTERNAL,
+        )
+    from comfy_extras.nodes_images import SVG
+
+    raw = decode_envelope_data(envelope)
+    text = raw.decode("utf-8", "replace")
+    # Split per-frame on the closing tag; preserve the tag on the
+    # preceding chunk so each frame remains a complete SVG document.
+    closing = "</svg>"
+    parts: list[BytesIO] = []
+    cursor = 0
+    while True:
+        idx = text.find(closing, cursor)
+        if idx < 0:
+            tail = text[cursor:].strip()
+            if tail:
+                parts.append(BytesIO(tail.encode("utf-8")))
+            break
+        end = idx + len(closing)
+        chunk = text[cursor:end].strip()
+        if chunk:
+            parts.append(BytesIO(chunk.encode("utf-8")))
+        cursor = end
+    declared = envelope.get("count")
+    if isinstance(declared, int) and declared > 0 and declared != len(parts):
+        log.warning(
+            "SVG envelope count=%d but parsed %d documents — server payload may be malformed",
+            declared, len(parts),
+        )
+    if not parts:
+        raise RnpProtocolError(
+            "SVG envelope payload contained no <svg> documents",
+            code=ErrorCode.INTERNAL,
+        )
+    return SVG(parts)
+
+
+# ---------------------------------------------------------------------------
 # Dispatch by envelope type
 # ---------------------------------------------------------------------------
 
@@ -261,6 +317,7 @@ _DECODERS = {
     "mask":  decode_mask_envelope,
     "audio": decode_audio_envelope,
     "video": decode_video_envelope,
+    "svg":   decode_svg_envelope,
 }
 
 
@@ -310,6 +367,7 @@ __all__ = [
     "encode_audio_input",
     "decode_audio_envelope",
     "decode_video_envelope",
+    "decode_svg_envelope",
     "decode_envelope",
     "is_envelope",
     "is_image_tensor",

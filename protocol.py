@@ -96,11 +96,12 @@ class Capability:
     VIDEO_MP4_INLINE = "video:mp4_inline"
     AUDIO_MP3_INLINE = "audio:mp3_inline"
     MASK_PNG_BASE64 = "mask:png_base64"
+    SVG_XML_BASE64 = "svg:svg_xml_base64"
     SCHEMA_V3 = "schema:v3"
     ASYNC_EXECUTE = "execute:async"
 
 
-HEAVY_TYPES = frozenset({"image", "video", "audio", "mask"})
+HEAVY_TYPES = frozenset({"image", "video", "audio", "mask", "svg"})
 
 
 def is_envelope(value: Any) -> bool:
