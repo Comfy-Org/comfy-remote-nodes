@@ -28,15 +28,24 @@ from .protocol import (
 log = logging.getLogger("comfy_remote_nodes.client")
 
 
-# Capability tokens advertised on every outbound request. Currently
-# covers the input/output encodings the registered providers (LTXV,
-# Gemini) need, plus the ``schema:v3`` marker so descriptors come back
-# in the V3 ``get_v1_info()`` shape.
+# Capability tokens advertised on every outbound request. Covers every
+# input/output encoding ``serialization.py`` knows how to round-trip,
+# plus the ``schema:v3`` marker so descriptors come back in the V3
+# ``get_v1_info()`` shape. Audio rides as ``mp3_base64`` outbound (the
+# encoder always re-encodes a ComfyUI AUDIO dict via
+# ``audio_input_to_mp3``) and decodes any of mp3_base64/mp3_inline/
+# wav_base64/wav_inline inbound — Stability returns wav_base64 by
+# default.
 CLIENT_CAPABILITIES = [
     Capability.SCHEMA_V3,
     Capability.VIDEO_MP4_INLINE,
     Capability.IMAGE_PNG_BASE64,
     Capability.MASK_PNG_BASE64,
+    Capability.AUDIO_MP3_BASE64,
+    Capability.AUDIO_WAV_BASE64,
+    Capability.AUDIO_MP3_INLINE,
+    Capability.AUDIO_WAV_INLINE,
+    Capability.SVG_XML_BASE64,
 ]
 
 # Reported in the X-RNP-Client-Version header.
