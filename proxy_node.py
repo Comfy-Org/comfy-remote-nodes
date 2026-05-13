@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 import uuid
 from typing import Any
@@ -38,11 +39,13 @@ from . import client as rnp_client
 from . import serialization
 from .protocol import (
     DEFAULT_CANCEL_TIMEOUT_S,
-    DEFAULT_MAX_POLL_ATTEMPTS,
+    DEFAULT_HARD_TIMEOUT_S,
     DEFAULT_MAX_RETRIES_PER_POLL,
+    DEFAULT_POLL_GRACE_S,
     DEFAULT_POLL_INTERVAL_S,
     DEFAULT_RETRY_BACKOFF_PER_POLL,
     DEFAULT_RETRY_DELAY_PER_POLL_S,
+    DEFAULT_SOFT_TIMEOUT_S,
     DEFAULT_TIMEOUT_PER_POLL_S,
     ErrorCode,
     ExecutionMode,
@@ -148,19 +151,32 @@ def _extract_execution_policy(execution: dict[str, Any]) -> dict[str, Any]:
     node with an empty ``execution`` block behaves identically to a
     direct upstream call. The schema is the wire contract from
     ``comfy_rnp_protocol.constants``: ``poll_interval_s``,
-    ``max_poll_attempts``, ``timeout_per_poll_s``, ``cancel_timeout_s``,
-    ``max_retries_per_poll``, ``retry_delay_per_poll_s``,
-    ``retry_backoff_per_poll``, ``retry: {max, delay_s, backoff,
-    retry_on}``, ``idempotency``.
+    ``soft_timeout_s``, ``hard_timeout_s``, ``timeout_per_poll_s``,
+    ``cancel_timeout_s``, ``max_retries_per_poll``,
+    ``retry_delay_per_poll_s``, ``retry_backoff_per_poll``,
+    ``retry: {max, delay_s, backoff, retry_on}``, ``idempotency``.
+
+    The client's poll-loop cap (``max_poll_attempts``) is **derived**
+    from ``hard_timeout_s + DEFAULT_POLL_GRACE_S`` and
+    ``poll_interval_s`` — there is no wire field for it. Coupling a
+    contract bound to a cadence value silently breaks every time you
+    tune the cadence; expressing the bound as a duration keeps the
+    contract invariant under cadence changes (see protocol.py
+    "Lifetime budget design" comment).
     """
     retry_block = execution.get("retry") if isinstance(execution.get("retry"), dict) else {}
+    poll_interval_s = _coerce_pos(
+        execution.get("poll_interval_s"), DEFAULT_POLL_INTERVAL_S,
+    )
+    hard_timeout_s = _coerce_pos(
+        execution.get("hard_timeout_s"),
+        _coerce_pos(execution.get("soft_timeout_s"), DEFAULT_HARD_TIMEOUT_S),
+    )
+    poll_budget_s = hard_timeout_s + DEFAULT_POLL_GRACE_S
+    max_poll_attempts = max(1, math.ceil(poll_budget_s / poll_interval_s))
     return {
-        "poll_interval_s": _coerce_pos(
-            execution.get("poll_interval_s"), DEFAULT_POLL_INTERVAL_S,
-        ),
-        "max_poll_attempts": _coerce_pos_int(
-            execution.get("max_poll_attempts"), DEFAULT_MAX_POLL_ATTEMPTS,
-        ),
+        "poll_interval_s": poll_interval_s,
+        "max_poll_attempts": max_poll_attempts,
         "timeout_per_poll_s": _coerce_pos(
             execution.get("timeout_per_poll_s"), DEFAULT_TIMEOUT_PER_POLL_S,
         ),
