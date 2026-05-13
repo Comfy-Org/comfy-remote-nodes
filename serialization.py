@@ -237,8 +237,46 @@ def decode_audio_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Video decode (encode lands when a remote node accepts VIDEO inputs)
+# Video encode / decode
 # ---------------------------------------------------------------------------
+
+def encode_video_input(video: Any) -> dict[str, Any]:
+    """Encode a ComfyUI ``Input.Video`` object as an mp4-base64 video
+    envelope.
+
+    Mirrors the local ``upload_video_to_comfyapi`` two-step (allocate
+    presigned slot + PUT) but bundles the bytes inline so the server
+    sees them in one POST. Re-encodes the source through
+    ``video.save_to(buf, format=MP4, codec=H264)`` to normalize the
+    container — Bria's ``BriaRemoveVideoBackground`` (and any other
+    ``output_container_and_codec="mp4_h264"`` vendor) only accepts
+    MP4/H264.
+    """
+    from comfy_api.latest import Types
+
+    buf = BytesIO()
+    video.save_to(
+        buf,
+        format=Types.VideoContainer.MP4,
+        codec=Types.VideoCodec.H264,
+    )
+    body = buf.getvalue()
+    extra: dict[str, Any] = {}
+    try:
+        duration_s = float(video.get_duration())
+        extra["duration_s"] = duration_s
+    except Exception:  # noqa: BLE001
+        # ``get_duration`` is best-effort on the Video protocol —
+        # missing duration just means the server can't pre-validate
+        # against a duration bound.
+        pass
+    return {
+        "type":     "video",
+        "encoding": "mp4_base64",
+        "data":     base64.b64encode(body).decode("ascii"),
+        **extra,
+    }
+
 
 def decode_video_envelope(envelope: dict[str, Any]) -> Any:
     """Decode a video envelope into a ComfyUI Video object (mp4 inline)."""
@@ -250,6 +288,22 @@ def decode_video_envelope(envelope: dict[str, Any]) -> Any:
         )
     from comfy_api.latest import InputImpl
     return InputImpl.VideoFromFile(BytesIO(decode_envelope_data(envelope)))
+
+
+def is_video_input(value: Any) -> bool:
+    """Best-effort check for a ComfyUI Video object (``Input.Video``).
+
+    Detected by duck-typing on ``save_to`` + ``get_duration`` — both
+    are required by the ``VideoInput`` protocol in
+    ``comfy_api.latest._input.video_types``. Avoids importing
+    ``comfy_api`` at decode-dispatch time so this module stays cheap
+    to import in a non-ComfyUI process.
+    """
+    return (
+        not isinstance(value, dict)
+        and hasattr(value, "save_to")
+        and hasattr(value, "get_duration")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +427,7 @@ __all__ = [
     "decode_mask_envelope",
     "encode_audio_input",
     "decode_audio_envelope",
+    "encode_video_input",
     "decode_video_envelope",
     "decode_svg_envelope",
     "decode_envelope",
@@ -380,4 +435,5 @@ __all__ = [
     "is_image_tensor",
     "is_mask_tensor",
     "is_audio_input",
+    "is_video_input",
 ]

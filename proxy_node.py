@@ -1353,6 +1353,8 @@ def _dict_contains_tensor(value: Any) -> bool:
 def _encode_one(name: str, value: Any) -> Any:
     if serialization.is_audio_input(value):
         return serialization.encode_audio_input(value)
+    if serialization.is_video_input(value):
+        return serialization.encode_video_input(value)
     if (
         isinstance(value, dict)
         and not serialization.is_envelope(value)

@@ -105,6 +105,7 @@ class Capability:
     IMAGE_JPEG_BASE64 = "image:jpeg_base64"
     IMAGE_RAW_CHW_UINT8 = "image:raw_b64_chw_uint8"
     VIDEO_MP4_INLINE = "video:mp4_inline"
+    VIDEO_MP4_BASE64 = "video:mp4_base64"
     AUDIO_MP3_INLINE = "audio:mp3_inline"
     AUDIO_MP3_BASE64 = "audio:mp3_base64"
     AUDIO_WAV_BASE64 = "audio:wav_base64"
