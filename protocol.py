@@ -21,7 +21,18 @@ DEFAULT_POLL_INTERVAL_S = 1.5
 # Values mirror comfy_api_nodes.util.client.poll_op_raw so RNP-routed
 # nodes behave identically to a direct upstream call when the descriptor
 # leaves a field unset.
-DEFAULT_MAX_POLL_ATTEMPTS = 160
+#
+# Lifetime budget design: the wire format declares ``soft_timeout_s``
+# (server-side stuck threshold) and ``hard_timeout_s`` (server-side
+# hard kill) as durations. The client's poll-loop cap is a derived
+# value — ``max_poll_attempts = ceil((hard_timeout_s + DEFAULT_POLL_GRACE_S)
+# / poll_interval_s)`` — not a separate wire field, so changing the
+# poll cadence can never silently shrink or stretch the contract.
+# Industry precedent: OAuth2 device flow §3.5, Kubernetes
+# ``--timeout``, gRPC deadlines all express bounds as durations.
+DEFAULT_SOFT_TIMEOUT_S = 240.0
+DEFAULT_HARD_TIMEOUT_S = 300.0
+DEFAULT_POLL_GRACE_S = 30.0
 DEFAULT_TIMEOUT_PER_POLL_S = 120.0
 DEFAULT_MAX_RETRIES_PER_POLL = 10
 DEFAULT_RETRY_DELAY_PER_POLL_S = 1.0
