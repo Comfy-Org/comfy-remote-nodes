@@ -30,12 +30,18 @@ log = logging.getLogger("comfy_remote_nodes.client")
 
 # Capability tokens advertised on every outbound request. Currently
 # covers the input/output encodings the registered providers (LTXV,
-# Gemini) need, plus the ``schema:v3`` marker so descriptors come back
-# in the V3 ``get_v1_info()`` shape.
+# Gemini, Ideogram, ...) need, plus the ``schema:v3`` marker so
+# descriptors come back in the V3 ``get_v1_info()`` shape. Servers use
+# this list to negotiate per-request: e.g. a provider only emits the
+# multi-frame ``image:png_base64_batch`` envelope when this list
+# contains :data:`Capability.IMAGE_PNG_BASE64_BATCH`, otherwise it
+# falls back to the single-frame ``image:png_base64`` shape (with a
+# server-side truncation warning logged when extras are dropped).
 CLIENT_CAPABILITIES = [
     Capability.SCHEMA_V3,
     Capability.VIDEO_MP4_INLINE,
     Capability.IMAGE_PNG_BASE64,
+    Capability.IMAGE_PNG_BASE64_BATCH,
     Capability.MASK_PNG_BASE64,
 ]
 

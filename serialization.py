@@ -121,8 +121,18 @@ def encode_image_tensor(tensor: Any) -> dict[str, Any]:
 
 
 def decode_image_envelope(envelope: dict[str, Any]) -> Any:
-    """Decode an image envelope into a ComfyUI IMAGE tensor (B,H,W,C float32)."""
+    """Decode an image envelope into a ComfyUI IMAGE tensor.
+
+    Single-frame encodings (``png_base64``, ``jpeg_base64``,
+    ``webp_base64``) decode into ``[1, H, W, C]``. The multi-frame
+    ``png_base64_batch`` encoding (a list of base64-PNG ``frames``)
+    stacks each frame into ``[B, H, W, C]`` — the native ComfyUI
+    image-batch shape — so providers whose upstream returns ``n > 1``
+    surface as a real batched tensor in the workflow runtime.
+    """
     encoding = envelope.get("encoding")
+    if encoding == "png_base64_batch":
+        return _decode_image_batch_envelope(envelope)
     if encoding not in ("png_base64", "jpeg_base64", "webp_base64"):
         raise RnpProtocolError(
             f"Unsupported image encoding: {encoding!r}",
@@ -139,6 +149,69 @@ def decode_image_envelope(envelope: dict[str, Any]) -> Any:
     img = Image.open(BytesIO(raw)).convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr).unsqueeze(0)
+
+
+def _decode_image_batch_envelope(envelope: dict[str, Any]) -> Any:
+    """Decode a ``png_base64_batch`` envelope into ``[B, H, W, C]``.
+
+    The wire shape is ``{"type":"image", "encoding":"png_base64_batch",
+    "frames":[<png_b64>, ...], "shape":[B,H,W,C], ...}``. Each frame is
+    a PNG-encoded image; all frames must share the same H/W after the
+    RGB conversion (the server-side encoder enforces this). A frame
+    count mismatch against the ``shape[0]`` field surfaces as a hard
+    parse error rather than silently dropping frames — matches the SVG
+    decoder's ``count`` integrity check.
+    """
+    import base64 as _b64
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    frames = envelope.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise RnpProtocolError(
+            "image batch envelope missing or empty 'frames' list",
+            code=ErrorCode.INTERNAL,
+        )
+    declared_shape = envelope.get("shape")
+    if isinstance(declared_shape, list) and len(declared_shape) >= 1:
+        declared_b = int(declared_shape[0])
+        if declared_b != len(frames):
+            raise RnpProtocolError(
+                f"image batch envelope frame count {len(frames)} does not "
+                f"match declared shape[0]={declared_b}",
+                code=ErrorCode.INTERNAL,
+            )
+
+    arrs: list[Any] = []
+    base_hw: tuple[int, int] | None = None
+    for idx, frame_b64 in enumerate(frames):
+        if not isinstance(frame_b64, str):
+            raise RnpProtocolError(
+                f"image batch frame {idx} is not a base64 string",
+                code=ErrorCode.INTERNAL,
+            )
+        try:
+            raw = _b64.b64decode(frame_b64)
+            img = Image.open(BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            raise RnpProtocolError(
+                f"image batch frame {idx} failed to decode: {e}",
+                code=ErrorCode.INTERNAL,
+            ) from e
+        arr = np.array(img).astype(np.float32) / 255.0
+        if base_hw is None:
+            base_hw = (arr.shape[0], arr.shape[1])
+        elif (arr.shape[0], arr.shape[1]) != base_hw:
+            raise RnpProtocolError(
+                f"image batch frame {idx} size {arr.shape[:2]} does not "
+                f"match frame 0 size {base_hw} (server should have rejected "
+                f"this; likely a wire bug)",
+                code=ErrorCode.INTERNAL,
+            )
+        arrs.append(arr)
+    stacked = np.stack(arrs, axis=0)
+    return torch.from_numpy(stacked)
 
 
 # ---------------------------------------------------------------------------
