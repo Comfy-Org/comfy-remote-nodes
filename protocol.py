@@ -93,6 +93,12 @@ class Capability:
     IMAGE_PNG_BASE64 = "image:png_base64"
     IMAGE_JPEG_BASE64 = "image:jpeg_base64"
     IMAGE_RAW_CHW_UINT8 = "image:raw_b64_chw_uint8"
+    # Multi-frame IMAGE envelope: a single value carries N PNG-base64
+    # frames sharing the same H/W/C, decoded into a [B,H,W,C] tensor on
+    # this client. Mirrors the AUDIO sweep precedent (parallel encodings
+    # rather than extending ``png_base64``) so legacy server emits still
+    # decode correctly when the new token isn't advertised.
+    IMAGE_PNG_BASE64_BATCH = "image:png_base64_batch"
     VIDEO_MP4_INLINE = "video:mp4_inline"
     AUDIO_MP3_INLINE = "audio:mp3_inline"
     MASK_PNG_BASE64 = "mask:png_base64"
