@@ -110,6 +110,20 @@ class Capability:
     # rather than extending ``png_base64``) so legacy server emits still
     # decode correctly when the new token isn't advertised.
     IMAGE_PNG_BASE64_BATCH = "image:png_base64_batch"
+    # Externalised counterpart of ``image:png_base64_batch``: same
+    # multi-frame IMAGE envelope shape, but every frame's PNG bytes
+    # are uploaded out-of-band via the presigned-PUT path (see
+    # ``serialization.maybe_externalize``) and the envelope carries
+    # a parallel ``uris`` list instead of inline ``frames``. Required
+    # because the original ``maybe_externalize`` only inspected the
+    # singleton ``data`` field, so a batch of N PNGs whose summed
+    # base64 payload crossed the 8 MiB inline cap silently rode the
+    # wire as a 30+ MiB POST body. Per-frame URIs (NOT a tar/zip
+    # blob) keep this composable with the existing per-frame fetch
+    # helpers and let the server fetch in parallel. Decoder dispatch
+    # keys off the ``encoding`` string — ``frames`` vs ``uris`` is a
+    # payload field, not a shape selector.
+    IMAGE_PNG_BASE64_BATCH_URI = "image:png_base64_batch_uri"
     VIDEO_MP4_INLINE = "video:mp4_inline"
     VIDEO_MP4_BASE64 = "video:mp4_base64"
     AUDIO_MP3_INLINE = "audio:mp3_inline"
