@@ -43,6 +43,17 @@ CLIENT_CAPABILITIES = [
     Capability.VIDEO_MP4_BASE64,
     Capability.IMAGE_PNG_BASE64,
     Capability.IMAGE_PNG_BASE64_BATCH,
+    # Advertises that this client can emit a multi-frame IMAGE
+    # envelope with per-frame presigned-GET URIs instead of inline
+    # base64 frames when the summed batch payload would overflow the
+    # 8 MiB inline cap (see ``serialization.maybe_externalize``).
+    # Opportunistic: the client falls back to it whenever a batch
+    # envelope it produced exceeds the cap, so descriptors don't
+    # need to publish it in their ``input_serialization`` to
+    # benefit — any input that already accepts ``png_base64_batch``
+    # transparently accepts the externalised variant on the server
+    # via the shared ``resolve_image_envelope_pngs`` dispatch.
+    Capability.IMAGE_PNG_BASE64_BATCH_URI,
     Capability.MASK_PNG_BASE64,
     Capability.AUDIO_MP3_INLINE,
     Capability.AUDIO_MP3_BASE64,

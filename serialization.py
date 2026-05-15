@@ -17,6 +17,7 @@ tensor — no parallel dialect.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from io import BytesIO
@@ -56,14 +57,46 @@ async def maybe_externalize(
     max_inline_bytes: int | None,
     auth_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """If the envelope's inline data exceeds ``max_inline_bytes``,
-    upload the bytes and replace ``data`` with ``uri``.
+    """If the envelope's inline payload exceeds ``max_inline_bytes``,
+    upload it via the presigned-PUT path and rewrite the envelope to
+    reference the uploaded asset(s) instead of inlining base64.
+
+    Two payload shapes are recognised:
+
+    * Singleton ``data`` envelopes (the common single-frame IMAGE /
+      MASK / VIDEO / AUDIO case). Oversize payloads upload as one
+      asset and the envelope's ``data`` field is swapped for ``uri``.
+    * Multi-frame ``frames=[…]`` IMAGE envelopes (encoding
+      ``png_base64_batch``). The original ``maybe_externalize`` only
+      inspected ``data`` and so silently let a 9× 2048² Flux2 batch
+      ride the wire as a 200 MB POST body — defeating the entire
+      reason the cap exists. The new path computes the summed raw
+      byte budget (``sum(len(b64)) * 3 // 4`` — base64 expands 4:3 so
+      this is the exact payload the server would receive) and, if it
+      crosses the cap, uploads each frame as an individual presigned
+      PUT in parallel via :func:`asyncio.gather` then rewrites the
+      envelope to ``encoding=png_base64_batch_uri`` with a parallel
+      ``uris`` list. ``shape`` / ``dtype`` / ``color_space`` ride
+      through unchanged so the server-side decoder still sees the
+      batch dimension. Per-frame URIs (NOT a tar/zip blob) compose
+      with the existing per-frame fetch helpers and let the server
+      fetch in parallel.
 
     No-op when either argument is falsy, the envelope already has a
-    ``uri``, or the inline payload fits under the cap.
+    ``uri`` / ``uris``, or the inline payload fits under the cap.
     """
     if not server_url or not max_inline_bytes:
         return envelope
+
+    frames = envelope.get("frames")
+    if isinstance(frames, list) and frames:
+        return await _maybe_externalize_batch(
+            envelope, frames,
+            server_url=server_url,
+            max_inline_bytes=max_inline_bytes,
+            auth_headers=auth_headers,
+        )
+
     data = envelope.get("data")
     if not isinstance(data, str):
         return envelope
@@ -81,6 +114,76 @@ async def maybe_externalize(
     )
     out = {k: v for k, v in envelope.items() if k != "data"}
     out["uri"] = download_url
+    return out
+
+
+async def _maybe_externalize_batch(
+    envelope: dict[str, Any],
+    frames: list[Any],
+    *,
+    server_url: str,
+    max_inline_bytes: int,
+    auth_headers: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Externalise a multi-frame IMAGE envelope when its summed inline
+    payload overflows ``max_inline_bytes``.
+
+    Per-frame upload (NOT a tar/zip blob): each frame becomes its own
+    presigned-PUT asset so the server can fetch in parallel and the
+    existing per-frame ``resolve_image_envelope_pngs`` helper picks
+    up the URI shape transparently. ``asyncio.gather`` issues every
+    PUT in parallel — the dominant latency for a 9-frame Flux2 batch
+    is the upload, not the server hop, so serialising would multiply
+    end-to-end submit time by N. Frame ordering is preserved (gather
+    returns positional results) — critical because a Flux2 provider
+    maps ``uris[k]`` → ``input_image_{k+1}`` 1:1.
+    """
+    # Cap on raw byte count (base64 expands 4:3, so multiplying by
+    # 3/4 recovers the actual payload the server would receive).
+    total_raw = 0
+    for f in frames:
+        if isinstance(f, str):
+            total_raw += len(f) * 3 // 4
+    if total_raw <= max_inline_bytes:
+        return envelope
+
+    env_type = envelope.get("type", "")
+    content_type = _CONTENT_TYPE_FOR_TYPE.get(env_type, "application/octet-stream")
+
+    async def _upload_one(idx: int, frame_b64: Any) -> str:
+        if not isinstance(frame_b64, str):
+            raise RnpProtocolError(
+                f"image batch frame {idx} is not a base64 string "
+                f"(got {type(frame_b64).__name__})",
+                code=ErrorCode.INTERNAL,
+            )
+        raw = base64.b64decode(frame_b64)
+        return await rnp_client.upload_asset(
+            server_url, raw,
+            content_type=content_type,
+            auth_headers=auth_headers,
+        )
+
+    uris = await asyncio.gather(
+        *(_upload_one(i, f) for i, f in enumerate(frames))
+    )
+    log.info(
+        "RNP: externalized %s batch envelope (%d frames, %d raw bytes) "
+        "-> %d presigned URIs",
+        env_type, len(frames), total_raw, len(uris),
+    )
+
+    # Strip the inline ``frames`` field; preserve ``shape`` / ``dtype``
+    # / ``color_space`` so the server-side decoder still sees the
+    # batch dimension and per-frame metadata. Encoding flips to the
+    # URI variant so dispatch keys cleanly off the string (NOT field
+    # presence — frames vs. uris is a payload field, not a shape
+    # selector).
+    out: dict[str, Any] = {
+        k: v for k, v in envelope.items() if k != "frames"
+    }
+    out["encoding"] = "png_base64_batch_uri"
+    out["uris"] = list(uris)
     return out
 
 
