@@ -121,7 +121,9 @@ def _build_proxy_node_stub(
     tree = ast.parse(src)
     wanted = {
         "_collect_local_validate",
+        "_rules_from_input_spec",
         "_enforce_local_validate",
+        "_check_image_max_batch",
         "_encode_one",
         "_encode_inputs",
     }
@@ -169,6 +171,65 @@ def _no_validate_descriptor() -> dict:
             "optional": {
                 "images": ["IMAGE", {"tooltip": "no cap"}],
             },
+            "hidden": {},
+        },
+    }
+
+
+def _autogrow_descriptor(cap: int, prefix: str = "reference") -> dict:
+    """Mirrors GrokVideoReferenceNode_RNP's top-level Autogrow input
+    after server descriptor unwraps the nested DynamicCombo branch
+    (kept simpler here for direct AUTOGROW coverage)."""
+    return {
+        "name": "FakeAutogrow_RNP",
+        "input": {
+            "required": {
+                "reference_images": ["AUTOGROW", {
+                    "template": ["IMAGE", {
+                        "local_validate": {"image_max_batch": cap},
+                    }],
+                    "prefix": prefix,
+                    "min": 1,
+                    "max": cap,
+                }],
+            },
+            "optional": {},
+            "hidden": {},
+        },
+    }
+
+
+def _dyncombo_with_autogrow_descriptor() -> dict:
+    """Mirrors GrokImageEditNodeV2_RNP's ``model`` DynamicCombo with
+    two branches each carrying an Autogrow ``images`` template — one
+    capped at 3, the other at 1."""
+    def branch(key: str, cap: int) -> dict:
+        return {
+            "key": key,
+            "inputs": [
+                ["images", "AUTOGROW", {
+                    "template": ["IMAGE", {
+                        "local_validate": {"image_max_batch": cap},
+                    }],
+                    "prefix": "image",
+                    "min": 1,
+                    "max": cap,
+                }],
+                ["resolution", "COMBO", {"options": ["1K", "2K"]}],
+            ],
+        }
+    return {
+        "name": "FakeDynComboAutogrow_RNP",
+        "input": {
+            "required": {
+                "model": ["DYNAMIC_COMBO", {
+                    "options": [
+                        branch("grok-imagine-image-quality", 3),
+                        branch("grok-imagine-image-pro", 1),
+                    ],
+                }],
+            },
+            "optional": {},
             "hidden": {},
         },
     }
@@ -260,7 +321,119 @@ async def main() -> int:
     assert "images" in out
     print("ok: missing image_max_batch sub-key is a no-op")
 
-    print("PASS: image_max_batch local_validate smoke test")
+    # ---- 7. AUTOGROW: each slot value enforced against the template cap
+    desc_ag = _autogrow_descriptor(cap=2)
+    rules_ag = proxy_node._collect_local_validate(desc_ag)
+    assert "reference_images" in rules_ag, rules_ag
+    assert rules_ag["reference_images"].get("__template__") == {"image_max_batch": 2}, rules_ag
+    print("ok: AUTOGROW collected __template__ rules:", rules_ag)
+
+    one_frame = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+    raised = False
+    try:
+        # Slot 1 is over-cap (B=3 > cap=2) → should fire on that slot
+        await proxy_node._encode_inputs(
+            {"reference_images": {"reference0": one_frame, "reference1": over_cap}},
+            local_validate=rules_ag,
+            node_id="FakeAutogrow_RNP",
+        )
+    except protocol.RnpProtocolError as e:
+        raised = True
+        assert e.code == protocol.ErrorCode.INPUT_INVALID
+        msg = str(e)
+        # Slot path label should mention reference_images.<slot_key>
+        assert "reference_images" in msg, msg
+        assert "reference1" in msg, msg
+        print("ok: AUTOGROW slot over-cap fired:", msg)
+    assert raised, "AUTOGROW slot over-cap did not raise"
+
+    # All-under-cap autogrow passes (no exception)
+    out = await proxy_node._encode_inputs(
+        {"reference_images": {"reference0": one_frame, "reference1": one_frame, "reference2": None}},
+        local_validate=rules_ag,
+        node_id="FakeAutogrow_RNP",
+    )
+    assert "reference_images" in out
+    print("ok: AUTOGROW all-under-cap (None slots tolerated) passed")
+
+    # ---- 8. DYNAMIC_COMBO with nested AUTOGROW: branch-aware enforcement
+    desc_dc = _dyncombo_with_autogrow_descriptor()
+    rules_dc = proxy_node._collect_local_validate(desc_dc)
+    assert "model" in rules_dc, rules_dc
+    branches = rules_dc["model"].get("__branches__")
+    assert isinstance(branches, dict), rules_dc
+    assert "grok-imagine-image-quality" in branches
+    assert "grok-imagine-image-pro" in branches
+    assert branches["grok-imagine-image-quality"]["images"]["__template__"] == {"image_max_batch": 3}
+    assert branches["grok-imagine-image-pro"]["images"]["__template__"] == {"image_max_batch": 1}
+    print("ok: DYNAMIC_COMBO collected branch-keyed templates")
+
+    # Branch A (cap=3): slot with B=4 should raise
+    over_4 = torch.zeros((4, 64, 64, 3), dtype=torch.float32)
+    raised = False
+    try:
+        await proxy_node._encode_inputs(
+            {"model": {
+                "model": "grok-imagine-image-quality",
+                "resolution": "1K",
+                "images": {"image0": over_4},
+            }},
+            local_validate=rules_dc,
+            node_id="FakeDynComboAutogrow_RNP",
+        )
+    except protocol.RnpProtocolError as e:
+        raised = True
+        assert e.code == protocol.ErrorCode.INPUT_INVALID
+        msg = str(e)
+        assert "image0" in msg and "3" in msg and "4" in msg, msg
+        print("ok: DYNAMIC_COMBO branch-A (cap=3) fired on B=4 slot:", msg)
+    assert raised
+
+    # Branch A (cap=3): all slots within cap → passes
+    out = await proxy_node._encode_inputs(
+        {"model": {
+            "model": "grok-imagine-image-quality",
+            "resolution": "2K",
+            "images": {"image0": one_frame, "image1": one_frame, "image2": one_frame},
+        }},
+        local_validate=rules_dc,
+        node_id="FakeDynComboAutogrow_RNP",
+    )
+    assert "model" in out
+    print("ok: DYNAMIC_COMBO branch-A all-under-cap passed")
+
+    # Branch B (cap=1): a B=3 slot fires the single-frame copy
+    raised = False
+    try:
+        await proxy_node._encode_inputs(
+            {"model": {
+                "model": "grok-imagine-image-pro",
+                "resolution": "2K",
+                "images": {"image0": over_cap},
+            }},
+            local_validate=rules_dc,
+            node_id="FakeDynComboAutogrow_RNP",
+        )
+    except protocol.RnpProtocolError as e:
+        raised = True
+        assert e.code == protocol.ErrorCode.INPUT_INVALID
+        assert "single image" in str(e), str(e)
+        print("ok: DYNAMIC_COMBO branch-B (cap=1) fired single-frame copy:", str(e))
+    assert raised
+
+    # Unknown branch key → no enforcement (defensive)
+    out = await proxy_node._encode_inputs(
+        {"model": {
+            "model": "unknown-branch-key",
+            "images": {"image0": over_cap},
+        }},
+        local_validate=rules_dc,
+        node_id="FakeDynComboAutogrow_RNP",
+    )
+    assert "model" in out
+    print("ok: DYNAMIC_COMBO unknown branch key is a defensive no-op")
+
+    print("PASS: image_max_batch local_validate smoke test (incl. nested traversal)")
     return 0
 
 
