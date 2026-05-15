@@ -305,6 +305,23 @@ def build_node_class(
     schema_hash = remote.get("schema_hash")
     execute_path = execute_endpoint["path"]
     execution = remote.get("execution") or {}
+    # ``descriptor.remote.input_serialization`` advertises the wire
+    # encodings each input accepts. The wire shape is
+    # ``{input_name: <str | list[str]>}`` — single string for a
+    # single-encoding input (e.g. ``"png_base64"``), list when the
+    # input accepts multiple encodings (e.g.
+    # ``["png_base64", "png_base64_batch"]`` for a multi-frame IMAGE).
+    # Normalize to ``dict[str, list[str]]`` so the encoder can do a
+    # single ``in`` check per input without re-parsing per call.
+    raw_input_serialization = (
+        remote.get("input_serialization") if isinstance(remote.get("input_serialization"), dict) else {}
+    )
+    input_serialization: dict[str, list[str]] = {}
+    for name, val in raw_input_serialization.items():
+        if isinstance(val, str):
+            input_serialization[name] = [val]
+        elif isinstance(val, list):
+            input_serialization[name] = [v for v in val if isinstance(v, str)]
     timeout_s = float(
         execution.get("hard_timeout_s")
         or execution.get("soft_timeout_s")
@@ -385,6 +402,7 @@ def build_node_class(
                 execution_mode=execution_mode,
                 execution_policy=execution_policy,
                 url_fetch_policy=url_fetch_policy,
+                input_serialization=input_serialization,
             )
 
     RemoteProxyNode.__name__ = node_id
@@ -846,6 +864,7 @@ async def _execute_remote(
     execution_mode: str = ExecutionMode.REQUEST_RESPONSE,
     execution_policy: dict[str, Any] | None = None,
     url_fetch_policy: dict[str, Any] | None = None,
+    input_serialization: dict[str, list[str]] | None = None,
 ) -> IO.NodeOutput:
     policy = execution_policy or _extract_execution_policy({})
     url_fetch_policy = url_fetch_policy or {}
@@ -879,11 +898,16 @@ async def _execute_remote(
     # Encode heavy-typed inputs (IMAGE/MASK/AUDIO) as RNP value
     # envelopes; scalars pass through. Oversized envelopes are
     # uploaded out-of-band and rewritten to ``{..., uri: <url>}``.
+    # ``input_serialization`` carries the per-input encoding allow-list
+    # from the descriptor — the encoder uses it to decide whether to
+    # ship a multi-frame ``png_base64_batch`` envelope or fall back
+    # to single-frame ``png_base64``.
     payload_inputs = await _encode_inputs(
         inputs,
         server_url=server_url,
         max_inline_bytes=max_inline_bytes,
         auth_headers=auth_headers,
+        input_serialization=input_serialization or {},
     )
 
     ticker_node_id = _node_id_for_ticker(cls)
@@ -1141,6 +1165,7 @@ async def _encode_inputs(
     server_url: str | None = None,
     max_inline_bytes: int | None = None,
     auth_headers: dict[str, str] | None = None,
+    input_serialization: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Convert in-place: replace heavy-typed input values with the
     matching RNP value envelope. Scalars pass through unchanged.
@@ -1156,10 +1181,16 @@ async def _encode_inputs(
     When ``max_inline_bytes`` is set, any envelope whose inline payload
     exceeds the threshold is externalized via ``POST /rnp/v1/uploads``
     (see ``serialization.maybe_externalize``).
+
+    ``input_serialization`` is the descriptor's per-input encoding
+    allow-list (e.g. ``{"images": ["png_base64", "png_base64_batch"]}``).
+    The encoder consults it to decide whether a multi-frame IMAGE input
+    can ride a single batch envelope vs. falling back to single-frame.
     """
+    serialization_map = input_serialization or {}
     out: dict[str, Any] = {}
     for name, value in inputs.items():
-        encoded = _encode_one(name, value)
+        encoded = _encode_one(name, value, serialization_map.get(name))
         # Only envelope-shaped values can be externalized; scalars pass
         # straight through ``maybe_externalize`` unchanged.
         if serialization.is_envelope(encoded):
@@ -1173,7 +1204,11 @@ async def _encode_inputs(
     return out
 
 
-def _encode_one(name: str, value: Any) -> Any:
+def _encode_one(
+    name: str,
+    value: Any,
+    accepted_encodings: list[str] | None = None,
+) -> Any:
     if serialization.is_audio_input(value):
         return serialization.encode_audio_input(value)
     if not serialization._is_torch_tensor(value):
@@ -1181,10 +1216,17 @@ def _encode_one(name: str, value: Any) -> Any:
     rank = value.dim()
     last_dim = int(value.shape[-1]) if rank >= 1 else 0
     if rank == 4 or (rank == 3 and last_dim in (3, 4)):
-        # Per-image tensors: a length-1 batch is the common case; longer
-        # batches send only the first frame (the framework hasn't asked
-        # for batch-of-envelopes semantics yet).
-        return serialization.encode_image_tensor(value)
+        # Per-image tensors: a length-1 batch is the common case.
+        # When the descriptor advertises ``"png_base64_batch"`` for
+        # this input AND the tensor has > 1 frame, ship the multi-
+        # frame envelope; otherwise fall back to single-frame
+        # (``tensor[0]`` for batches >1, full tensor for length-1).
+        accepts_batch = bool(
+            accepted_encodings and "png_base64_batch" in accepted_encodings
+        )
+        return serialization.encode_image_tensor(
+            value, accepts_batch=accepts_batch,
+        )
     if rank in (2, 3):
         return serialization.encode_mask_tensor(value)
     log.warning(
