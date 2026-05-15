@@ -84,12 +84,30 @@ async def maybe_externalize(
 
     No-op when either argument is falsy, the envelope already has a
     ``uri`` / ``uris``, or the inline payload fits under the cap.
+
+    Dispatch keys off the ``encoding`` string — NOT field presence
+    (``frames`` vs. ``data``). An encoder that emitted ``frames`` for
+    a non-batch encoding by accident, or shipped both fields together,
+    used to silently take the batch branch and externalise garbage;
+    keying off the canonical encoding catches that as a hard ``frames``
+    check inside the batch branch itself.
     """
     if not server_url or not max_inline_bytes:
         return envelope
 
-    frames = envelope.get("frames")
-    if isinstance(frames, list) and frames:
+    encoding = envelope.get("encoding")
+    if encoding == "png_base64_batch":
+        frames = envelope.get("frames")
+        if not isinstance(frames, list) or not frames:
+            # Mirror the server-side make_image_batch_envelope contract:
+            # an empty/missing frames list is a hard wire bug, NOT a
+            # silent no-op (which used to ship through under the old
+            # ``isinstance(frames, list) and frames`` dispatch and then
+            # blow up on the server's resolve_image_envelope_pngs check).
+            raise RnpProtocolError(
+                "png_base64_batch envelope requires a non-empty 'frames' list",
+                code=ErrorCode.INTERNAL,
+            )
         return await _maybe_externalize_batch(
             envelope, frames,
             server_url=server_url,
