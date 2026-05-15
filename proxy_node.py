@@ -326,6 +326,15 @@ def build_node_class(
             input_serialization[name] = [val]
         elif isinstance(val, list):
             input_serialization[name] = [v for v in val if isinstance(v, str)]
+
+    # ``descriptor.input.<section>.<name>[1].local_validate`` carries
+    # declarative client-side validation rules (e.g.
+    # ``{"image_max_batch": 9}`` for a Flux2 reference-image input).
+    # The encoder consults this map and raises ``INPUT_INVALID``
+    # locally before any HTTP round trip when an over-cap batch is
+    # wired in. Lookup is defensive: missing ``local_validate`` →
+    # no validation; missing per-rule key → no validation.
+    local_validate = _collect_local_validate(descriptor)
     timeout_s = float(
         execution.get("hard_timeout_s")
         or execution.get("soft_timeout_s")
@@ -407,6 +416,7 @@ def build_node_class(
                 execution_policy=execution_policy,
                 url_fetch_policy=url_fetch_policy,
                 input_serialization=input_serialization,
+                local_validate=local_validate,
             )
 
     RemoteProxyNode.__name__ = node_id
@@ -430,6 +440,37 @@ _HIDDEN_MARKERS = {
     "EXTRA_PNGINFO":        IO.Hidden.extra_pnginfo,
     "DYNPROMPT":            IO.Hidden.dynprompt,
 }
+
+
+def _collect_local_validate(descriptor: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Pull ``local_validate`` rule dicts off every required/optional input
+    spec in the descriptor.
+
+    Returns ``{input_name: rules_dict}`` for every input that carries a
+    non-empty ``local_validate`` block, e.g.
+    ``{"images": {"image_max_batch": 9}}`` for Flux2's reference-image
+    input. Inputs without ``local_validate`` are omitted so the encoder
+    can use a single ``in`` check per call.
+
+    Inputs nested inside AUTOGROW templates / DYNAMIC_COMBO branches are
+    not surfaced here — they ride the autogrow/combo wire shape and the
+    proxy_node parser doesn't yet flatten them into top-level inputs;
+    the cap declared on those templates documents the future contract.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    input_def = descriptor.get("input") or {}
+    for kind in ("required", "optional"):
+        defs = input_def.get(kind) or {}
+        for name, spec in defs.items():
+            if not isinstance(spec, (list, tuple)) or len(spec) < 2:
+                continue
+            options = spec[1]
+            if not isinstance(options, dict):
+                continue
+            rules = options.get("local_validate")
+            if isinstance(rules, dict) and rules:
+                out[name] = dict(rules)
+    return out
 
 
 def _parse_inputs(descriptor: dict[str, Any]) -> tuple[list[Any] | None, list[str]]:
@@ -898,6 +939,7 @@ async def _execute_remote(
     execution_policy: dict[str, Any] | None = None,
     url_fetch_policy: dict[str, Any] | None = None,
     input_serialization: dict[str, list[str]] | None = None,
+    local_validate: dict[str, dict[str, Any]] | None = None,
 ) -> IO.NodeOutput:
     policy = execution_policy or _extract_execution_policy({})
     url_fetch_policy = url_fetch_policy or {}
@@ -941,6 +983,8 @@ async def _execute_remote(
         max_inline_bytes=max_inline_bytes,
         auth_headers=auth_headers,
         input_serialization=input_serialization or {},
+        local_validate=local_validate or {},
+        node_id=node_id,
     )
 
     ticker_node_id = _node_id_for_ticker(cls)
@@ -1199,6 +1243,8 @@ async def _encode_inputs(
     max_inline_bytes: int | None = None,
     auth_headers: dict[str, str] | None = None,
     input_serialization: dict[str, list[str]] | None = None,
+    local_validate: dict[str, dict[str, Any]] | None = None,
+    node_id: str | None = None,
 ) -> dict[str, Any]:
     """Convert in-place: replace heavy-typed input values with the
     matching RNP value envelope. Scalars pass through unchanged.
@@ -1219,10 +1265,23 @@ async def _encode_inputs(
     allow-list (e.g. ``{"images": ["png_base64", "png_base64_batch"]}``).
     The encoder consults it to decide whether a multi-frame IMAGE input
     can ride a single batch envelope vs. falling back to single-frame.
+
+    ``local_validate`` is the per-input declarative-rule map
+    (e.g. ``{"images": {"image_max_batch": 9}}``). For each rule the
+    encoder enforces the constraint locally and raises
+    ``RnpProtocolError(code=INPUT_INVALID, user_facing=True)`` so the
+    proxy_node's friendly-message dispatch surfaces a per-provider
+    error before any paid HTTP round trip. Lookup is defensive: a
+    missing ``local_validate`` entry or missing per-rule key is a
+    no-op.
     """
     serialization_map = input_serialization or {}
+    validate_map = local_validate or {}
     out: dict[str, Any] = {}
     for name, value in inputs.items():
+        _enforce_local_validate(
+            name, value, validate_map.get(name) or {}, node_id=node_id,
+        )
         encoded = _encode_one(name, value, serialization_map.get(name))
         # Only envelope-shaped values can be externalized; scalars pass
         # straight through ``maybe_externalize`` unchanged.
@@ -1235,6 +1294,63 @@ async def _encode_inputs(
             )
         out[name] = encoded
     return out
+
+
+def _enforce_local_validate(
+    name: str,
+    value: Any,
+    rules: dict[str, Any],
+    *,
+    node_id: str | None,
+) -> None:
+    """Apply each ``local_validate.*`` rule to ``value`` and raise
+    ``RnpProtocolError(INPUT_INVALID)`` on a violation.
+
+    Rules currently supported:
+
+    * ``image_max_batch`` — for IMAGE inputs (rank-4 tensors), assert
+      ``tensor.shape[0] <= cap``. Mirrors the per-call cap raised on
+      the server (e.g. Flux2 raises "The current maximum number of
+      supported images is 9.") so a workflow with N>cap reference
+      frames fails fast on the client before any paid HTTP round trip.
+    """
+    if not rules:
+        return
+    cap = rules.get("image_max_batch")
+    if cap is None:
+        return
+    try:
+        cap_int = int(cap)
+    except (TypeError, ValueError):
+        return
+    if not serialization._is_torch_tensor(value):
+        return
+    rank = value.dim()
+    last_dim = int(value.shape[-1]) if rank >= 1 else 0
+    if not (rank == 4 or (rank == 3 and last_dim in (3, 4))):
+        return
+    batch = int(value.shape[0]) if rank == 4 else 1
+    if batch <= cap_int:
+        return
+    label = f" ({node_id})" if node_id else ""
+    if cap_int == 1:
+        msg = (
+            f"Remote node{label}: input {name!r} expects a single image "
+            f"frame, got a batch of {batch}. Wire a single-frame IMAGE "
+            f"into this input."
+        )
+    else:
+        msg = (
+            f"Remote node{label}: input {name!r} accepts at most "
+            f"{cap_int} image frames, got a batch of {batch}. The "
+            f"current maximum number of supported images is "
+            f"{cap_int}."
+        )
+    raise RnpProtocolError(
+        msg,
+        code=ErrorCode.INPUT_INVALID,
+        user_facing=True,
+    )
 
 
 def _encode_one(
