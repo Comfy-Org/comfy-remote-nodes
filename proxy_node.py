@@ -444,33 +444,107 @@ _HIDDEN_MARKERS = {
 
 def _collect_local_validate(descriptor: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Pull ``local_validate`` rule dicts off every required/optional input
-    spec in the descriptor.
+    spec in the descriptor, recursing into AUTOGROW templates and
+    DYNAMIC_COMBO branches.
 
     Returns ``{input_name: rules_dict}`` for every input that carries a
-    non-empty ``local_validate`` block, e.g.
-    ``{"images": {"image_max_batch": 9}}`` for Flux2's reference-image
-    input. Inputs without ``local_validate`` are omitted so the encoder
-    can use a single ``in`` check per call.
+    non-empty ``local_validate`` block (or whose nested template /
+    branches do). The returned ``rules_dict`` may carry the literal
+    ``local_validate`` keys (e.g. ``{"image_max_batch": 9}``) plus two
+    private composite keys consumed by ``_enforce_local_validate``:
 
-    Inputs nested inside AUTOGROW templates / DYNAMIC_COMBO branches are
-    not surfaced here — they ride the autogrow/combo wire shape and the
-    proxy_node parser doesn't yet flatten them into top-level inputs;
-    the cap declared on those templates documents the future contract.
+    * ``__template__`` — for AUTOGROW inputs, the rules harvested from
+      the template's options dict. The enforcer applies these to every
+      slot value in the runtime Autogrow dict
+      (``{"image0": <env>, "image1": <env>, ...}``).
+    * ``__branches__`` — for DYNAMIC_COMBO inputs, a
+      ``{branch_key: {sub_name: rules}}`` map. The enforcer reads the
+      selected branch from ``value[<name>]`` and walks the matching
+      branch's sub-inputs (used by GPT Image V2 / Grok ImageEditV2 /
+      Grok VideoReference, where the cap lives on a nested Autogrow
+      template inside a DynamicCombo branch).
+
+    Inputs whose entire subtree is empty are omitted so the encoder can
+    use a single ``in`` check per call.
     """
     out: dict[str, dict[str, Any]] = {}
     input_def = descriptor.get("input") or {}
     for kind in ("required", "optional"):
         defs = input_def.get(kind) or {}
         for name, spec in defs.items():
-            if not isinstance(spec, (list, tuple)) or len(spec) < 2:
-                continue
-            options = spec[1]
-            if not isinstance(options, dict):
-                continue
-            rules = options.get("local_validate")
-            if isinstance(rules, dict) and rules:
-                out[name] = dict(rules)
+            rules = _rules_from_input_spec(spec)
+            if rules:
+                out[name] = rules
     return out
+
+
+def _rules_from_input_spec(spec: Any) -> dict[str, Any]:
+    """Extract ``local_validate`` rules from one V3 input spec.
+
+    Accepts both wire shapes:
+
+    * ``[io_type, options_dict]`` — top-level inputs (the descriptor's
+      ``input.required[name]`` value, or an AUTOGROW template).
+    * ``[name, io_type, options_dict]`` — DynamicCombo branch sub-inputs
+      (each entry of ``options.options[i].inputs``).
+
+    For ``AUTOGROW`` specs, recurses into ``options["template"]`` and
+    stashes the result under ``__template__``. For ``DYNAMIC_COMBO``,
+    walks each branch's sub-inputs and stashes the resulting
+    ``{branch_key: {sub_name: sub_rules}}`` map under ``__branches__``.
+    """
+    if not isinstance(spec, (list, tuple)) or len(spec) < 2:
+        return {}
+    if (
+        len(spec) >= 3
+        and isinstance(spec[1], str)
+        and isinstance(spec[2], dict)
+    ):
+        # [name, io_type, options]
+        io_type, options = spec[1], spec[2]
+    elif isinstance(spec[1], dict):
+        # [io_type, options]
+        io_type, options = spec[0], spec[1]
+    else:
+        return {}
+    rules: dict[str, Any] = {}
+    direct = options.get("local_validate")
+    if isinstance(direct, dict) and direct:
+        rules.update(direct)
+    if io_type == "AUTOGROW":
+        tmpl_spec = options.get("template")
+        tmpl_rules = (
+            _rules_from_input_spec(tmpl_spec)
+            if isinstance(tmpl_spec, (list, tuple))
+            else {}
+        )
+        if tmpl_rules:
+            rules["__template__"] = tmpl_rules
+    elif io_type == "DYNAMIC_COMBO":
+        branches: dict[str, dict[str, Any]] = {}
+        for opt in (options.get("options") or []):
+            if not isinstance(opt, dict):
+                continue
+            key = opt.get("key")
+            if not isinstance(key, str):
+                continue
+            sub_rules: dict[str, dict[str, Any]] = {}
+            for sub_spec in (opt.get("inputs") or []):
+                if (
+                    not isinstance(sub_spec, (list, tuple))
+                    or len(sub_spec) < 1
+                    or not isinstance(sub_spec[0], str)
+                ):
+                    continue
+                sub_name = sub_spec[0]
+                r = _rules_from_input_spec(sub_spec)
+                if r:
+                    sub_rules[sub_name] = r
+            if sub_rules:
+                branches[key] = sub_rules
+        if branches:
+            rules["__branches__"] = branches
+    return rules
 
 
 def _parse_inputs(descriptor: dict[str, Any]) -> tuple[list[Any] | None, list[str]]:
@@ -1313,10 +1387,53 @@ def _enforce_local_validate(
       the server (e.g. Flux2 raises "The current maximum number of
       supported images is 9.") so a workflow with N>cap reference
       frames fails fast on the client before any paid HTTP round trip.
+
+    Two private composite keys are walked transparently:
+
+    * ``__template__`` (AUTOGROW) — ``value`` is expected to be a
+      runtime Autogrow dict (``{"image0": <env>, "image1": <env>, ...}``).
+      The template's rules are applied to each non-``None`` slot value.
+    * ``__branches__`` (DYNAMIC_COMBO) — ``value`` is expected to be the
+      DynamicCombo runtime dict whose ``value[<name>]`` carries the
+      selected branch key. The matching branch's per-sub-input rules are
+      applied recursively. This is what makes GPT Image V2 / Grok
+      ImageEditV2 / Grok VideoReference's nested per-slot caps fire
+      client-side before any HTTP round trip.
     """
     if not rules:
         return
-    cap = rules.get("image_max_batch")
+    _check_image_max_batch(name, value, rules.get("image_max_batch"), node_id=node_id)
+    tmpl = rules.get("__template__")
+    if isinstance(tmpl, dict) and isinstance(value, dict):
+        for slot_key, slot_value in value.items():
+            if slot_value is None:
+                continue
+            _enforce_local_validate(
+                f"{name}.{slot_key}", slot_value, tmpl, node_id=node_id,
+            )
+    branches = rules.get("__branches__")
+    if isinstance(branches, dict) and isinstance(value, dict):
+        branch_key = value.get(name)
+        if isinstance(branch_key, str):
+            sub_rules_map = branches.get(branch_key)
+            if isinstance(sub_rules_map, dict):
+                for sub_name, sub_rules in sub_rules_map.items():
+                    if sub_name in value:
+                        _enforce_local_validate(
+                            f"{name}.{sub_name}", value[sub_name], sub_rules,
+                            node_id=node_id,
+                        )
+
+
+def _check_image_max_batch(
+    name: str,
+    value: Any,
+    cap: Any,
+    *,
+    node_id: str | None,
+) -> None:
+    """Apply the ``image_max_batch`` rule. No-op if cap is missing /
+    non-int / value is not a recognisable image tensor."""
     if cap is None:
         return
     try:
