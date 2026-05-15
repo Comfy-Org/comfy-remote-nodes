@@ -50,6 +50,15 @@ CLIENT_CAPABILITIES = [
     # that only knows ``/execute`` doesn't silently submit a
     # long-poll node into the sync endpoint.
     Capability.ASYNC_EXECUTE,
+    # Generic opaque pass-through bucket for partner helper-config
+    # custom IO types (OPENAI_INPUT_FILES, OPENAI_CHAT_CONFIG,
+    # GEMINI_INPUT_FILES, RECRAFT_*, future partner helper types).
+    # Servers may gate descriptors that publish ``input_serialization``
+    # / ``output_serialization`` entries with the ``"opaque"`` marker
+    # on the presence of this token; legacy clients that don't know
+    # about IO.Custom fallthrough get filtered out before they try to
+    # parse a descriptor whose io_type strings they wouldn't recognise.
+    Capability.IO_OPAQUE,
 ]
 
 # Reported in the X-RNP-Client-Version header.

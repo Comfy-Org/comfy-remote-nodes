@@ -115,6 +115,17 @@ class Capability:
     MASK_PNG_BASE64 = "mask:png_base64"
     SCHEMA_V3 = "schema:v3"
     ASYNC_EXECUTE = "execute:async"
+    # Pass-through custom-IO bucket: when an input/output type string
+    # is not in the standard primitive/media set, the proxy_node parser
+    # falls back to ``IO.Custom(<type>)`` so partner helper-config nodes
+    # (OpenAIInputFiles, OpenAIChatConfig, GeminiInputFiles, Recraft
+    # style/color/controls helpers, future partner helper-config types)
+    # round-trip without per-type encoder plumbing. The descriptor's
+    # original io_type string is preserved on the V3 input so node-to-
+    # node connections only chain when the strings match. Encoder
+    # dispatch passes opaque dict/list/string values through
+    # ``_encode_one`` unchanged — they're already JSON-serialisable.
+    IO_OPAQUE = "io:opaque"
 
 
 HEAVY_TYPES = frozenset({"image", "video", "audio", "mask"})

@@ -3,9 +3,13 @@
 The descriptor wire format is V3 ``Schema.get_v1_info()`` verbatim, so
 per-input dicts are handed straight to V3's IO classes without
 reinterpretation. ``_parse_input_spec`` knows STRING / INT / FLOAT /
-BOOLEAN / COMBO / IMAGE / VIDEO / AUDIO / MASK; an input outside that
-set causes the whole node to be skipped with a warning rather than
-half-built.
+BOOLEAN / COMBO / IMAGE / VIDEO / AUDIO / MASK; any other io_type
+string falls through to ``IO.Custom(io_type)`` (the §B opaque
+pass-through bucket — partner helper-config types like RECRAFT_*,
+OPENAI_INPUT_FILES, OPENAI_CHAT_CONFIG, GEMINI_INPUT_FILES round-trip
+as raw JSON blobs with the original io_type preserved on the V3
+socket, so node-to-node connections only chain when the strings
+match). Only a non-string / empty io_type causes a skip.
 
 Hidden inputs (``auth_token_comfy_org`` / ``api_key_comfy_org`` /
 ``unique_id`` / ``prompt`` / ``extra_pnginfo`` / ``dynprompt``) are
@@ -498,6 +502,22 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
         return IO.Audio.Input(name, **common)
     if io_type == "MASK":
         return IO.Mask.Input(name, **common)
+    # Opaque custom-IO fallthrough — any unknown io_type string becomes
+    # an ``IO.Custom(io_type)`` socket so partner helper-config nodes
+    # (OpenAIInputFiles → OPENAI_INPUT_FILES, OpenAIChatConfig →
+    # OPENAI_CHAT_CONFIG, GeminiInputFiles → GEMINI_INPUT_FILES, the
+    # already-shipped Recraft RECRAFT_* helpers, future partner types)
+    # round-trip without per-type encoder plumbing. The descriptor's
+    # original ``io_type`` string is preserved on ``IO.Custom``'s
+    # ComfyType.io_type via the V3 ``@comfytype`` decorator, so the
+    # frontend's connection-validity check only chains sockets when the
+    # strings match — an OPENAI_INPUT_FILES output cannot connect to a
+    # GEMINI_INPUT_FILES input. Encoder dispatch in
+    # ``serialization`` already passes non-tensor / non-audio values
+    # through ``_encode_one`` unchanged, and the deserializer treats
+    # non-envelope values as already-native Python objects.
+    if isinstance(io_type, str) and io_type:
+        return IO.Custom(io_type).Input(name, **common)
     return None
 
 
@@ -582,10 +602,23 @@ def _parse_outputs(descriptor: dict[str, Any]) -> list[Any] | None:
         tip = output_tooltips[i] if i < len(output_tooltips) else None
         cls = _OUTPUT_CLASSES.get(io_type)
         if cls is None:
-            log.warning(
-                "Skipping descriptor: unsupported output type %r", io_type,
-            )
-            return None
+            # Opaque custom-IO fallthrough (mirror of
+            # ``_parse_input_spec``) — any unknown output io_type
+            # string becomes ``IO.Custom(io_type).Output`` so partner
+            # helper-config nodes can publish their own opaque
+            # outputs (RECRAFT_*, OPENAI_INPUT_FILES, GEMINI_INPUT_FILES,
+            # OPENAI_CHAT_CONFIG, …). The original io_type string
+            # rides on the resulting Output via V3's ``@comfytype``
+            # decorator, so the frontend only chains output→input
+            # sockets when the strings match.
+            if isinstance(io_type, str) and io_type:
+                cls = IO.Custom(io_type).Output
+            else:
+                log.warning(
+                    "Skipping descriptor: unsupported output type %r",
+                    io_type,
+                )
+                return None
         out.append(cls(display_name=name, is_output_list=is_list, tooltip=tip))
     return out
 
