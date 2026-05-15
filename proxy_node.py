@@ -1233,8 +1233,54 @@ async def _deserialize_output(
         # advisory here, the value already matches the native ComfyUI
         # type for STRING / INT / FLOAT / BOOLEAN.
         return value
-    if "data" not in value and "uri" in value:
-        env_type = value.get("type", "")
+    encoding = value.get("encoding")
+    env_type = value.get("type", "")
+    if encoding == "png_base64_batch_uri":
+        # Externalised IMAGE batch on the response path (mirror of the
+        # request-side ``serialization.maybe_externalize`` behaviour).
+        # No server emits this shape today, but the decoder owns the
+        # symmetry: any envelope shape the client may externalise on
+        # the way out, the client must also accept on the way in.
+        # Per-frame URIs fetched in parallel via ``asyncio.gather`` so
+        # a 9-frame batch import is one round-trip rather than N — the
+        # GET fan-out is the dominant latency for an out-of-band batch.
+        # Frame ordering is preserved (gather returns positional
+        # results) — critical because the IMAGE tensor's batch axis
+        # carries semantic order.
+        policy = url_fetch_policy.get(env_type)
+        if not isinstance(policy, dict):
+            raise RnpProtocolError(
+                f"Server returned a URL batch envelope for output type "
+                f"{env_type!r} but the descriptor declared no "
+                f"remote.url_fetch policy for that type",
+                code=ErrorCode.INTERNAL,
+            )
+        uris = value.get("uris")
+        if not isinstance(uris, list) or not uris:
+            raise RnpProtocolError(
+                "png_base64_batch_uri envelope requires a non-empty 'uris' list",
+                code=ErrorCode.INTERNAL,
+            )
+        import asyncio as _asyncio
+        import base64 as _b64
+        per_frame_envs = [
+            {"type": env_type, "encoding": "png_base64", "uri": u}
+            for u in uris
+        ]
+        raws = await _asyncio.gather(*[
+            _fetch_url_envelope(
+                env, policy,
+                auth_headers=auth_headers,
+                node_cls=node_cls,
+            )
+            for env in per_frame_envs
+        ])
+        # Re-stamp as the inline batch shape so the existing
+        # ``_decode_image_batch_envelope`` path handles it uniformly.
+        value = {k: v for k, v in value.items() if k != "uris"}
+        value["encoding"] = "png_base64_batch"
+        value["frames"] = [_b64.b64encode(r).decode("ascii") for r in raws]
+    elif "data" not in value and "uri" in value:
         policy = url_fetch_policy.get(env_type)
         if not isinstance(policy, dict):
             raise RnpProtocolError(
