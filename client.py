@@ -43,6 +43,13 @@ CLIENT_CAPABILITIES = [
     Capability.IMAGE_PNG_BASE64,
     Capability.IMAGE_PNG_BASE64_BATCH,
     Capability.MASK_PNG_BASE64,
+    # Advertises that this client can drive the
+    # ``execute_async`` + poll-loop lifecycle (submit, poll, cancel,
+    # TASK_LOST replay). Servers gate ``async_polling``-mode
+    # descriptors on the presence of this token so an older client
+    # that only knows ``/execute`` doesn't silently submit a
+    # long-poll node into the sync endpoint.
+    Capability.ASYNC_EXECUTE,
 ]
 
 # Reported in the X-RNP-Client-Version header.
