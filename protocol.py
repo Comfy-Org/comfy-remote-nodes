@@ -111,8 +111,13 @@ class Capability:
     # decode correctly when the new token isn't advertised.
     IMAGE_PNG_BASE64_BATCH = "image:png_base64_batch"
     VIDEO_MP4_INLINE = "video:mp4_inline"
+    VIDEO_MP4_BASE64 = "video:mp4_base64"
     AUDIO_MP3_INLINE = "audio:mp3_inline"
+    AUDIO_MP3_BASE64 = "audio:mp3_base64"
+    AUDIO_WAV_BASE64 = "audio:wav_base64"
+    AUDIO_WAV_INLINE = "audio:wav_inline"
     MASK_PNG_BASE64 = "mask:png_base64"
+    SVG_XML_BASE64 = "svg:svg_xml_base64"
     SCHEMA_V3 = "schema:v3"
     ASYNC_EXECUTE = "execute:async"
     # Pass-through custom-IO bucket: when an input/output type string

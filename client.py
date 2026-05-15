@@ -40,9 +40,14 @@ log = logging.getLogger("comfy_remote_nodes.client")
 CLIENT_CAPABILITIES = [
     Capability.SCHEMA_V3,
     Capability.VIDEO_MP4_INLINE,
+    Capability.VIDEO_MP4_BASE64,
     Capability.IMAGE_PNG_BASE64,
     Capability.IMAGE_PNG_BASE64_BATCH,
     Capability.MASK_PNG_BASE64,
+    Capability.AUDIO_MP3_INLINE,
+    Capability.AUDIO_MP3_BASE64,
+    Capability.AUDIO_WAV_BASE64,
+    Capability.AUDIO_WAV_INLINE,
     # Advertises that this client can drive the
     # ``execute_async`` + poll-loop lifecycle (submit, poll, cancel,
     # TASK_LOST replay). Servers gate ``async_polling``-mode
