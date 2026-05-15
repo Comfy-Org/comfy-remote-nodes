@@ -88,18 +88,48 @@ async def maybe_externalize(
 # Image encode / decode
 # ---------------------------------------------------------------------------
 
-def encode_image_tensor(tensor: Any) -> dict[str, Any]:
-    """Encode a ComfyUI IMAGE tensor (B,H,W,C float32 in 0..1) as a
-    PNG-base64 image envelope.
+def encode_image_tensor(tensor: Any, *, accepts_batch: bool = False) -> dict[str, Any]:
+    """Encode a ComfyUI IMAGE tensor (B,H,W,C float32 in 0..1) as an
+    image envelope.
 
-    Multi-image batches send only the first frame for now; the
-    framework hasn't grown batch-of-envelopes semantics yet.
+    ``accepts_batch`` reflects whether the descriptor's
+    ``input_serialization`` for this input lists ``"png_base64_batch"``.
+    When True AND ``tensor.shape[0] > 1``, emit a multi-frame
+    ``png_base64_batch`` envelope (``frames=[<png_b64>, …]``) so the
+    server decodes a real ``[B, H, W, C]`` source. Otherwise emit a
+    single-frame ``png_base64`` envelope for ``tensor[0]`` — preserves
+    backwards compat with descriptors that haven't migrated yet, and
+    matches the wire shape of the existing ``_decode_image_batch_envelope``
+    on the response path so both directions round-trip symmetrically.
     """
     import numpy as np
     from PIL import Image
 
-    # Strip the batch dim if present.
-    if hasattr(tensor, "dim") and tensor.dim() == 4:
+    rank = getattr(tensor, "dim", lambda: 0)()
+    if rank == 4 and accepts_batch and int(tensor.shape[0]) > 1:
+        frames_arr = (tensor.cpu().clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
+        b, height, width = frames_arr.shape[:3]
+        channels = frames_arr.shape[3] if frames_arr.ndim == 4 else 1
+        pil_mode = {1: "L", 3: "RGB", 4: "RGBA"}.get(channels, "RGB")
+        frames_b64: list[str] = []
+        for i in range(b):
+            img = Image.fromarray(frames_arr[i], mode=pil_mode)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            frames_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        return {
+            "type":        "image",
+            "encoding":    "png_base64_batch",
+            "frames":      frames_b64,
+            "shape":       [b, height, width, channels],
+            "dtype":       "uint8",
+            "color_space": "srgb",
+        }
+
+    # Single-frame fallback: matches the old ``encode_image_tensor``
+    # contract (sends ``tensor[0]`` for a multi-frame batch when the
+    # descriptor doesn't advertise the batch encoding).
+    if rank == 4:
         frame = tensor[0]
     else:
         frame = tensor
