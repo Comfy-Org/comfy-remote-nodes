@@ -82,6 +82,15 @@ CLIENT_CAPABILITIES = [
     # about IO.Custom fallthrough get filtered out before they try to
     # parse a descriptor whose io_type strings they wouldn't recognise.
     Capability.IO_OPAQUE,
+    # 3D MODEL envelope (binary glTF 2.0 — single-mesh GLB). The
+    # decoder in ``serialization.decode_model3d_envelope`` hands raw
+    # GLB bytes to ``comfy_api.latest._util.File3D`` so downstream
+    # nodes (preview3d / SaveGLB / Load3D) see the same value shape
+    # they would from a local Tripo / Rodin / Meshy node. Servers
+    # gate ``MODEL_3D`` provider descriptors on this token so a
+    # legacy client without the decoder surfaces NEGOTIATION_FAILED
+    # at descriptor-load time rather than crashing at execute.
+    Capability.MODEL_3D_GLB_INLINE,
 ]
 
 # Reported in the X-RNP-Client-Version header.

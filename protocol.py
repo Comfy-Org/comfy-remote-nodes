@@ -153,9 +153,20 @@ class Capability:
     # dispatch passes opaque dict/list/string values through
     # ``_encode_one`` unchanged — they're already JSON-serialisable.
     IO_OPAQUE = "io:opaque"
+    # 3D MODEL envelope: a single-mesh GLB (binary glTF 2.0, magic
+    # b"glTF") wrapped opaquely in ``data`` (base64). Mirrors the
+    # parallel-encoding pattern already used for VIDEO_MP4_INLINE — the
+    # server emits this token only when the inbound request advertised
+    # it; legacy clients without the token will surface
+    # NEGOTIATION_FAILED at descriptor-load time. The decoder on the
+    # client side hands raw GLB bytes straight to ComfyUI's
+    # ``Types.File3D`` / ``IO.File3DGLB`` machinery (no in-server GLB
+    # parse — the magic-byte check at offset 0 is the only validity
+    # guard the server applies).
+    MODEL_3D_GLB_INLINE = "model_3d:glb_inline"
 
 
-HEAVY_TYPES = frozenset({"image", "video", "audio", "mask"})
+HEAVY_TYPES = frozenset({"image", "video", "audio", "mask", "model_3d"})
 
 
 def is_envelope(value: Any) -> bool:

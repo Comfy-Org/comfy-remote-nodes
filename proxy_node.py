@@ -757,14 +757,25 @@ def _parse_outputs(descriptor: dict[str, Any]) -> list[Any] | None:
 
 
 _OUTPUT_CLASSES = {
-    "VIDEO":   IO.Video.Output,
-    "IMAGE":   IO.Image.Output,
-    "AUDIO":   IO.Audio.Output,
-    "MASK":    IO.Mask.Output,
-    "STRING":  IO.String.Output,
-    "INT":     IO.Int.Output,
-    "FLOAT":   IO.Float.Output,
-    "BOOLEAN": IO.Boolean.Output,
+    "VIDEO":    IO.Video.Output,
+    "IMAGE":    IO.Image.Output,
+    "AUDIO":    IO.Audio.Output,
+    "MASK":     IO.Mask.Output,
+    "STRING":   IO.String.Output,
+    "INT":      IO.Int.Output,
+    "FLOAT":    IO.Float.Output,
+    "BOOLEAN":  IO.Boolean.Output,
+    # 3D MODEL output: the Tripo / Rodin / Meshy partner endpoints all
+    # return a single GLB file; the server emits a ``model_3d:glb_inline``
+    # envelope which ``serialization.decode_model3d_envelope`` turns
+    # back into a ``File3D`` so downstream nodes (preview3d / SaveGLB /
+    # Load3D) chain off the output socket unchanged. The descriptor
+    # io_type string is the logical name ``"MODEL_3D"`` (consistent
+    # across vendors) — the resulting V3 socket carries the upstream
+    # ``"FILE_3D_GLB"`` comfytype tag from ``IO.File3DGLB`` so
+    # frontend-side input/output matching works against any GLB-aware
+    # node.
+    "MODEL_3D": IO.File3DGLB.Output,
 }
 
 
