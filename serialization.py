@@ -451,7 +451,11 @@ def encode_audio_input(audio: dict[str, Any]) -> dict[str, Any]:
 def decode_audio_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
     """Decode an audio envelope back into a ComfyUI AUDIO dict."""
     encoding = envelope.get("encoding")
-    if encoding not in ("mp3_base64", "mp3_inline", "wav_base64", "wav_inline"):
+    if encoding not in (
+        "mp3_base64", "mp3_inline",
+        "wav_base64", "wav_inline",
+        "opus_base64",
+    ):
         raise RnpProtocolError(
             f"Unsupported audio encoding: {encoding!r}",
             code=ErrorCode.INTERNAL,
