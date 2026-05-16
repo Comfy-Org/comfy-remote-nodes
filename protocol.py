@@ -130,6 +130,14 @@ class Capability:
     AUDIO_MP3_BASE64 = "audio:mp3_base64"
     AUDIO_WAV_BASE64 = "audio:wav_base64"
     AUDIO_WAV_INLINE = "audio:wav_inline"
+    # OGG/Opus container as base64 in ``data``. Mirrors the parallel-
+    # encoding negotiation pattern already used for the AUDIO sweep
+    # (mp3 vs. wav) — servers only emit ``audio:opus_base64`` when
+    # this client advertises the token, otherwise they fall back to
+    # ``mp3_base64``. PyAV/FFmpeg decodes OGG/Opus natively so
+    # ``decode_audio_envelope`` ships the bytes through
+    # ``audio_bytes_to_audio_input`` the same way it ships MP3/WAV.
+    AUDIO_OPUS_BASE64 = "audio:opus_base64"
     MASK_PNG_BASE64 = "mask:png_base64"
     SVG_XML_BASE64 = "svg:svg_xml_base64"
     SCHEMA_V3 = "schema:v3"

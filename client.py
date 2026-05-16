@@ -59,6 +59,13 @@ CLIENT_CAPABILITIES = [
     Capability.AUDIO_MP3_BASE64,
     Capability.AUDIO_WAV_BASE64,
     Capability.AUDIO_WAV_INLINE,
+    # OGG/Opus decode path. PyAV / FFmpeg handle OGG/Opus natively in
+    # ``audio_bytes_to_audio_input`` so the proxy_node side is the
+    # same as MP3/WAV — advertising the token unlocks per-provider
+    # ``output_format`` choices that emit Opus (e.g. ElevenLabs'
+    # ``opus_48000_192``) without requiring servers to label-launder
+    # the upstream container as ``mp3_base64``.
+    Capability.AUDIO_OPUS_BASE64,
     # Advertises that this client can drive the
     # ``execute_async`` + poll-loop lifecycle (submit, poll, cancel,
     # TASK_LOST replay). Servers gate ``async_polling``-mode
