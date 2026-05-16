@@ -481,14 +481,42 @@ def decode_video_envelope(envelope: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# 3D model decode (encode lands when a remote node accepts MODEL_3D inputs)
+# ---------------------------------------------------------------------------
+
+def decode_model3d_envelope(envelope: dict[str, Any]) -> Any:
+    """Decode a 3D-model envelope into a ComfyUI ``File3D`` object.
+
+    Mirrors :func:`decode_video_envelope`: the only currently supported
+    encoding is ``glb_inline`` (binary glTF 2.0 — magic ``b"glTF"`` at
+    offset 0). The bytes are handed to ``File3D`` as a ``BytesIO`` so
+    downstream nodes (preview3d / SaveGLB / Load3D) see exactly the
+    same value shape they would from a local Tripo / Rodin / Meshy
+    node. The envelope's optional ``format`` extra is forwarded as the
+    second constructor arg so the materialiser picks the right file
+    extension when persisting.
+    """
+    encoding = envelope.get("encoding")
+    if encoding != "glb_inline":
+        raise RnpProtocolError(
+            f"Unsupported model_3d encoding: {encoding!r}",
+            code=ErrorCode.INTERNAL,
+        )
+    from comfy_api.latest._util import File3D
+    file_format = envelope.get("format") or "glb"
+    return File3D(BytesIO(decode_envelope_data(envelope)), str(file_format))
+
+
+# ---------------------------------------------------------------------------
 # Dispatch by envelope type
 # ---------------------------------------------------------------------------
 
 _DECODERS = {
-    "image": decode_image_envelope,
-    "mask":  decode_mask_envelope,
-    "audio": decode_audio_envelope,
-    "video": decode_video_envelope,
+    "image":    decode_image_envelope,
+    "mask":     decode_mask_envelope,
+    "audio":    decode_audio_envelope,
+    "video":    decode_video_envelope,
+    "model_3d": decode_model3d_envelope,
 }
 
 
@@ -538,6 +566,7 @@ __all__ = [
     "encode_audio_input",
     "decode_audio_envelope",
     "decode_video_envelope",
+    "decode_model3d_envelope",
     "decode_envelope",
     "is_envelope",
     "is_image_tensor",
