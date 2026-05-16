@@ -3,13 +3,17 @@
 The descriptor wire format is V3 ``Schema.get_v1_info()`` verbatim, so
 per-input dicts are handed straight to V3's IO classes without
 reinterpretation. ``_parse_input_spec`` knows STRING / INT / FLOAT /
-BOOLEAN / COMBO / IMAGE / VIDEO / AUDIO / MASK; any other io_type
-string falls through to ``IO.Custom(io_type)`` (the §B opaque
-pass-through bucket — partner helper-config types like RECRAFT_*,
-OPENAI_INPUT_FILES, OPENAI_CHAT_CONFIG, GEMINI_INPUT_FILES round-trip
-as raw JSON blobs with the original io_type preserved on the V3
-socket, so node-to-node connections only chain when the strings
-match). Only a non-string / empty io_type causes a skip.
+BOOLEAN / COMBO / IMAGE / VIDEO / AUDIO / MASK plus the two V3
+dynamic input types DYNAMIC_COMBO (branch-selector dropdown with
+per-branch sub-widgets) and AUTOGROW (variable-arity slot template);
+any other io_type string falls through to ``IO.Custom(io_type)`` (the
+§B opaque pass-through bucket — partner helper-config types like
+RECRAFT_*, OPENAI_INPUT_FILES, OPENAI_CHAT_CONFIG, GEMINI_INPUT_FILES
+round-trip as raw JSON blobs with the original io_type preserved on
+the V3 socket, so node-to-node connections only chain when the strings
+match). Only a non-string / empty io_type causes a skip. Malformed
+DYNAMIC_COMBO / AUTOGROW specs skip the descriptor (return ``None``)
+rather than degrading to a single opaque socket.
 
 Hidden inputs (``auth_token_comfy_org`` / ``api_key_comfy_org`` /
 ``unique_id`` / ``prompt`` / ``extra_pnginfo`` / ``dynprompt``) are
@@ -576,34 +580,90 @@ def _parse_inputs(descriptor: dict[str, Any]) -> tuple[list[Any] | None, list[st
 
 
 def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
-    """Map one V3-shaped ``[io_type, options_dict]`` entry to a V3 IO Input."""
+    """Map one V3-shaped ``[io_type, options_dict]`` entry to a V3 IO Input.
+
+    This is the top-level entry used by ``_parse_inputs`` (where the
+    name comes from the descriptor's ``input.required[name]`` /
+    ``input.optional[name]`` key) and recursively as the AUTOGROW
+    template entry (which also lacks a leading name field — the slot
+    name is provided by the surrounding AUTOGROW). Branch sub-inputs
+    inside a DYNAMIC_COMBO option use the 3-tuple ``[name, io_type,
+    options]`` form instead — see :func:`_parse_named_input_spec`.
+    """
     if not isinstance(spec, (list, tuple)) or len(spec) < 1:
         return None
     io_type = spec[0]
     options: dict[str, Any] = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+    return _build_input(name, io_type, options, optional)
+
+
+def _parse_named_input_spec(spec: list[Any], optional: bool) -> Any | None:
+    """Map one V3-shaped ``[name, io_type, options_dict]`` entry to a V3 IO Input.
+
+    This is the shape used inside ``DYNAMIC_COMBO`` options' ``inputs``
+    list (each branch sub-input carries its own name as ``spec[0]``).
+    Top-level descriptor inputs use the 2-tuple form handled by
+    :func:`_parse_input_spec`.
+    """
+    if (
+        not isinstance(spec, (list, tuple))
+        or len(spec) < 2
+        or not isinstance(spec[0], str)
+    ):
+        return None
+    name = spec[0]
+    io_type = spec[1]
+    options: dict[str, Any] = spec[2] if len(spec) > 2 and isinstance(spec[2], dict) else {}
+    return _build_input(name, io_type, options, optional)
+
+
+def _build_input(name: str, io_type: Any, options: dict[str, Any], optional: bool) -> Any | None:
+    """Shared dispatch: construct one V3 IO Input from a parsed
+    ``(name, io_type, options)`` triple.
+
+    Recurses for the two V3 dynamic input types:
+
+    * ``DYNAMIC_COMBO`` — selector dropdown whose per-branch sub-inputs
+      live in ``options.options[i].inputs`` (each entry is the 3-tuple
+      ``[name, io_type, options]`` form).
+    * ``AUTOGROW`` — variable-arity slot template. The RNP wire dialect
+      flattens upstream's ``Autogrow.Input.as_dict`` shape: ``template``
+      is a 2-tuple ``[io_type, options]`` entry directly, with
+      ``prefix`` / ``min`` / ``max`` (or ``names`` / ``min``) as siblings
+      of ``template`` rather than nested under ``template.template``.
+
+    Malformed dynamic specs return ``None`` (caller logs + skips the
+    whole descriptor) rather than falling through to the opaque
+    ``IO.Custom`` bucket — that would mask a protocol/schema bug as
+    "looks fine but renders as opaque socket".
+    """
     common = {
         "tooltip": options.get("tooltip"),
         "optional": optional,
     }
+    # ``advanced`` is only accepted by WidgetInput subclasses — the
+    # dynamic constructors (DynamicCombo.Input / Autogrow.Input) do
+    # not take it. Build a separate kwargs bag for primitives.
+    primitive_common = dict(common)
     if options.get("advanced") is not None:
-        common["advanced"] = bool(options.get("advanced"))
+        primitive_common["advanced"] = bool(options.get("advanced"))
 
     if isinstance(io_type, list):
         # Legacy V1-style combo: io_type *is* the options list.
         return IO.Combo.Input(name, options=list(io_type),
-                              default=options.get("default"), **common)
+                              default=options.get("default"), **primitive_common)
     if io_type == "COMBO":
         opts = options.get("options")
         if not isinstance(opts, (list, tuple)):
             return None
         return IO.Combo.Input(name, options=list(opts),
-                              default=options.get("default"), **common)
+                              default=options.get("default"), **primitive_common)
     if io_type == "STRING":
         return IO.String.Input(
             name,
             default=options.get("default", ""),
             multiline=bool(options.get("multiline", False)),
-            **common,
+            **primitive_common,
         )
     if io_type == "INT":
         return IO.Int.Input(
@@ -612,7 +672,7 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
             min=options.get("min", 0),
             max=options.get("max", 2147483647),
             step=options.get("step", 1),
-            **common,
+            **primitive_common,
         )
     if io_type == "FLOAT":
         return IO.Float.Input(
@@ -621,20 +681,115 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
             min=options.get("min", 0.0),
             max=options.get("max", 1.0),
             step=options.get("step", 0.01),
-            **common,
+            **primitive_common,
         )
     if io_type == "BOOLEAN":
         return IO.Boolean.Input(
-            name, default=bool(options.get("default", False)), **common,
+            name, default=bool(options.get("default", False)), **primitive_common,
         )
     if io_type == "IMAGE":
-        return IO.Image.Input(name, **common)
+        return IO.Image.Input(name, **primitive_common)
     if io_type == "VIDEO":
-        return IO.Video.Input(name, **common)
+        return IO.Video.Input(name, **primitive_common)
     if io_type == "AUDIO":
-        return IO.Audio.Input(name, **common)
+        return IO.Audio.Input(name, **primitive_common)
     if io_type == "MASK":
-        return IO.Mask.Input(name, **common)
+        return IO.Mask.Input(name, **primitive_common)
+    if io_type == "DYNAMIC_COMBO":
+        # Wire shape: ``["DYNAMIC_COMBO", {"options": [{"key": str,
+        # "inputs": [[name, io_type, opts], ...]}, ...], "tooltip": ...}]``.
+        # Empty branch input lists are valid (e.g. Bria moderation's
+        # "false" branch with ``"inputs": []``); the branch dropdown
+        # still needs to render. Malformed shape -> None (no opaque
+        # fallthrough — would mask a schema bug).
+        opts = options.get("options")
+        if not isinstance(opts, (list, tuple)):
+            return None
+        parsed_options: list[Any] = []
+        for opt in opts:
+            if not isinstance(opt, dict):
+                return None
+            key = opt.get("key")
+            if not isinstance(key, str):
+                return None
+            sub_specs = opt.get("inputs") or []
+            if not isinstance(sub_specs, (list, tuple)):
+                return None
+            sub_inputs: list[Any] = []
+            for sub_spec in sub_specs:
+                # Branch sub-inputs are always treated as required at
+                # schema-construction time — the wire dialect doesn't
+                # express per-branch optionality. Server-side runtime
+                # validation enforces presence via ``__branches__``.
+                sub = _parse_named_input_spec(sub_spec, optional=False)
+                if sub is None:
+                    return None
+                sub_inputs.append(sub)
+            parsed_options.append(IO.DynamicCombo.Option(key=key, inputs=sub_inputs))
+        return IO.DynamicCombo.Input(
+            name,
+            options=parsed_options,
+            tooltip=options.get("tooltip"),
+            optional=optional,
+        )
+    if io_type == "AUTOGROW":
+        # Wire shape (RNP-flattened):
+        # ``["AUTOGROW", {"template": [io_type, options],
+        #                  "prefix": str, "min": int, "max": int,
+        #                  "tooltip": ...}]``
+        # or with ``names`` instead of ``prefix`` / ``max`` for the
+        # TemplateNames variant.
+        tmpl_spec = options.get("template")
+        if not isinstance(tmpl_spec, (list, tuple)) or len(tmpl_spec) < 1:
+            return None
+        # Reuse top-level parser for the template — the slot name is
+        # cosmetic since TemplatePrefix / TemplateNames rename each
+        # cached copy per-slot.
+        template_input = _parse_input_spec(name, tmpl_spec, optional=False)
+        if template_input is None:
+            return None
+        # Upstream Autogrow asserts the template input is NOT itself a
+        # DynamicInput (DynamicCombo.Input / Autogrow.Input). Mirror
+        # that check at parse time so a malformed descriptor surfaces
+        # as "skipped" rather than blowing up later in the IO machinery.
+        if isinstance(
+            template_input,
+            (IO.DynamicCombo.Input, IO.Autogrow.Input),
+        ):
+            return None
+        if "names" in options:
+            names = options.get("names")
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                return None
+            try:
+                template = IO.Autogrow.TemplateNames(
+                    template_input,
+                    names=names,
+                    min=int(options.get("min", 1)),
+                )
+            except AssertionError:
+                return None
+        elif "prefix" in options:
+            prefix = options.get("prefix")
+            if not isinstance(prefix, str):
+                return None
+            try:
+                template = IO.Autogrow.TemplatePrefix(
+                    template_input,
+                    prefix=prefix,
+                    min=int(options.get("min", 1)),
+                    max=int(options.get("max", 10)),
+                )
+            except AssertionError:
+                return None
+        else:
+            return None
+        return IO.Autogrow.Input(
+            name,
+            template=template,
+            tooltip=options.get("tooltip"),
+            optional=optional,
+        )
     # Opaque custom-IO fallthrough — any unknown io_type string becomes
     # an ``IO.Custom(io_type)`` socket so partner helper-config nodes
     # (OpenAIInputFiles → OPENAI_INPUT_FILES, OpenAIChatConfig →
@@ -649,6 +804,11 @@ def _parse_input_spec(name: str, spec: list[Any], optional: bool) -> Any | None:
     # ``serialization`` already passes non-tensor / non-audio values
     # through ``_encode_one`` unchanged, and the deserializer treats
     # non-envelope values as already-native Python objects.
+    #
+    # NOTE: ``DYNAMIC_COMBO`` and ``AUTOGROW`` are handled above and
+    # never reach this fallthrough — malformed dynamic specs return
+    # ``None`` instead, so the caller logs + skips the descriptor
+    # rather than silently degrading to a single opaque socket.
     if isinstance(io_type, str) and io_type:
         return IO.Custom(io_type).Input(name, **common)
     return None
