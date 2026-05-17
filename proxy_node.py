@@ -695,6 +695,30 @@ def _build_input(name: str, io_type: Any, options: dict[str, Any], optional: boo
         return IO.Audio.Input(name, **primitive_common)
     if io_type == "MASK":
         return IO.Mask.Input(name, **primitive_common)
+    if io_type == "MODEL_3D":
+        # 3D MODEL input: symmetric counterpart of the ``"MODEL_3D"``
+        # entry in ``_OUTPUT_CLASSES`` above. The Tencent Hunyuan3D
+        # MODEL_3D-input nodes (``TencentModelTo3DUVNode`` /
+        # ``Tencent3DTextureEditNode`` / ``Tencent3DPartNode`` /
+        # ``TencentSmartTopologyNode``) all declare their model_3d
+        # input as ``IO.MultiType.Input(types=[IO.File3DGLB,
+        # IO.File3DOBJ, IO.File3DFBX, IO.File3DAny])`` so the socket
+        # accepts any upstream 3D source: ``Load3D``'s ``File3DAny``
+        # output, Meshy / Hunyuan3D / Tripo / Rodin's per-format
+        # outputs (``FILE_3D_GLB`` / ``FILE_3D_OBJ`` / ``FILE_3D_FBX``),
+        # etc. Mirror that union here so the proxy socket accepts the
+        # same set of comfytypes upstream does. Per-node format
+        # validation (e.g. 3DTextureEdit's FBX-only enforcement) is
+        # done server-side in the provider's ``execute()`` against
+        # the inline envelope's ``format`` extra; this socket-level
+        # filter is purely about frontend connection validity.
+        return IO.MultiType.Input(
+            name,
+            types=[
+                IO.File3DGLB, IO.File3DOBJ, IO.File3DFBX, IO.File3DAny,
+            ],
+            **primitive_common,
+        )
     if io_type == "DYNAMIC_COMBO":
         # Wire shape: ``["DYNAMIC_COMBO", {"options": [{"key": str,
         # "inputs": [[name, io_type, opts], ...]}, ...], "tooltip": ...}]``.
