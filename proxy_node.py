@@ -1600,17 +1600,65 @@ async def _encode_inputs(
             name, value, validate_map.get(name) or {}, node_id=node_id,
         )
         encoded = _encode_one(name, value, serialization_map.get(name))
-        # Only envelope-shaped values can be externalized; scalars pass
-        # straight through ``maybe_externalize`` unchanged.
-        if serialization.is_envelope(encoded):
-            encoded = await serialization.maybe_externalize(
-                encoded,
+        # Externalize any envelope payloads, walking into nested dicts so
+        # AUTOGROW slot values and DYNAMIC_COMBO sub-inputs whose encoded
+        # form is a per-slot envelope are uploaded the same way a
+        # top-level singleton envelope is. ``_externalize_nested`` is a
+        # no-op on plain scalars and on dicts that contain no envelopes.
+        encoded = await _externalize_nested(
+            encoded,
+            server_url=server_url,
+            max_inline_bytes=max_inline_bytes,
+            auth_headers=auth_headers,
+        )
+        out[name] = encoded
+    return out
+
+
+async def _externalize_nested(
+    value: Any,
+    *,
+    server_url: str | None,
+    max_inline_bytes: int | None,
+    auth_headers: dict[str, str] | None,
+) -> Any:
+    """Recursively externalize any RNP envelopes inside ``value``.
+
+    Mirrors :func:`_encode_one`'s dict-recursion: ComfyUI hands the
+    proxy_node nested AUTOGROW / DYNAMIC_COMBO runtime dicts
+    (e.g. ``{"reference_images": {"image1": <env>, "image2": <env>}}``
+    or ``{"model": {"branch": "wan2.7-r2v",
+    "video_refs": {"video1": <env>}}}``); without this walk the
+    per-slot envelopes would ship inline regardless of
+    ``max_inline_bytes`` because :func:`_encode_inputs` only inspected
+    the top-level value.
+
+    Stops at envelope leaves (delegates the per-envelope decision to
+    :func:`serialization.maybe_externalize`) and at plain scalars (leaves
+    them unchanged). Lists are intentionally left alone — AG/DC runtime
+    shapes always materialize as dicts, never lists, and recursing into
+    arbitrary lists would touch opaque payloads. Recursion is bounded
+    by the AUTOGROW max slot count (100) and the maximum DC branch
+    nesting depth (1 today), so an in-place ``async def`` walk is fine.
+    """
+    if serialization.is_envelope(value):
+        return await serialization.maybe_externalize(
+            value,
+            server_url=server_url,
+            max_inline_bytes=max_inline_bytes,
+            auth_headers=auth_headers,
+        )
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            out[k] = await _externalize_nested(
+                v,
                 server_url=server_url,
                 max_inline_bytes=max_inline_bytes,
                 auth_headers=auth_headers,
             )
-        out[name] = encoded
-    return out
+        return out
+    return value
 
 
 def _enforce_local_validate(
@@ -1718,6 +1766,22 @@ def _encode_one(
     value: Any,
     accepted_encodings: list[str] | None = None,
 ) -> Any:
+    # ComfyUI's V3 ``build_nested_inputs`` rebuilds AUTOGROW / DYNAMIC_COMBO
+    # runtime kwargs into nested dicts (``{"reference_images": {"image1":
+    # <tensor>, ...}}`` for top-level AG; ``{"<dc-name>": branch_key,
+    # "<nested-ag>": {"video1": <VideoInput>, ...}}`` for AG-inside-DC).
+    # Recurse into plain dicts so heavy leaves anywhere in that tree get
+    # encoded — without this an AG-of-IMAGE slot would ship the raw
+    # torch.Tensor inside a dict and crash at ``json.dumps`` time. Stops
+    # at envelope dicts (already-encoded payloads) so we don't double-
+    # encode wire-shape values that happen to be dicts.
+    if serialization.is_envelope(value):
+        return value
+    if isinstance(value, dict) and not serialization.is_audio_input(value):
+        return {
+            k: _encode_one(f"{name}.{k}", v, accepted_encodings)
+            for k, v in value.items()
+        }
     if serialization.is_audio_input(value):
         return serialization.encode_audio_input(value)
     if serialization.is_video_input(value):
