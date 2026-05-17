@@ -103,6 +103,20 @@ CLIENT_CAPABILITIES = [
     # this token; legacy clients surface NEGOTIATION_FAILED at
     # descriptor-load time rather than crashing at execute.
     Capability.MODEL_3D_BUNDLE_INLINE,
+    # Cross-node task handle envelope (vendor-native task / video /
+    # job IDs with lineage metadata for chained partner provider
+    # nodes — Tripo Texture/Refine/Rig/Retarget/Conversion, Kling
+    # VideoExtend, future partner chains). The decoder in
+    # ``serialization.decode_task_handle_envelope`` returns a
+    # ``TaskHandle`` dataclass rather than a plain ``str`` so the
+    # ``parent_chain`` lineage round-trips when the handle is passed
+    # through to a downstream provider node (re-encoded by
+    # ``serialization.encode_task_handle`` on the submit path).
+    # Servers gate handle-emitting AND handle-accepting descriptors
+    # on this token (whole-descriptor gating — partial-socket
+    # synthesis is rejected because a chain that breaks meaningfully
+    # if either end is missing is worse than no chain at all).
+    Capability.IO_TASK_HANDLE,
 ]
 
 # Reported in the X-RNP-Client-Version header.
