@@ -91,6 +91,18 @@ CLIENT_CAPABILITIES = [
     # legacy client without the decoder surfaces NEGOTIATION_FAILED
     # at descriptor-load time rather than crashing at execute.
     Capability.MODEL_3D_GLB_INLINE,
+    # 3D MODEL BUNDLE envelope (multi-file: primary mesh plus N
+    # companion files — textures / .mtl / .bin / etc. — as a single
+    # coherent unit). The decoder in
+    # ``serialization.decode_model3d_envelope`` dispatches on
+    # ``encoding="bundle_inline"`` and returns a ``BundledFile3D``
+    # (a ``File3D`` subclass) whose ``get_source()`` / ``save_to()``
+    # materialise the whole bundle on disk so cross-file refs (.obj
+    # -> .mtl -> textures; .gltf -> .bin + textures) resolve via
+    # the filesystem. Servers gate bundle-emitting descriptors on
+    # this token; legacy clients surface NEGOTIATION_FAILED at
+    # descriptor-load time rather than crashing at execute.
+    Capability.MODEL_3D_BUNDLE_INLINE,
 ]
 
 # Reported in the X-RNP-Client-Version header.
