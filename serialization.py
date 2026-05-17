@@ -796,164 +796,15 @@ def decode_model3d_envelope(envelope: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Cross-node task handle
-#
-# A ``task_handle`` envelope wraps a vendor-native task / video / job
-# ID (Tripo MODEL_TASK_ID, Kling video_id, ...) with lineage metadata
-# so chained provider nodes can pass the handle through the workflow
-# without losing the upstream chain. The decoder returns a
-# :class:`TaskHandle` dataclass — re-encoding the same dataclass on a
-# downstream submit (via :func:`encode_task_handle`) preserves the
-# full ``parent_chain`` without the proxy_node having to know
-# anything provider-specific. Plain ``str`` round-trip would silently
-# drop lineage, so the decoder deliberately surfaces the rich type
-# even at the cost of slightly more work on the consumer side.
-# ---------------------------------------------------------------------------
-
-from dataclasses import dataclass, field
-
-
-@dataclass
-class TaskHandle:
-    """Cross-node handle to a vendor-native async task / video / job.
-
-    See :data:`comfy_remote_nodes.protocol.Capability.IO_TASK_HANDLE`
-    for the wire-shape contract. The dataclass mirrors the envelope
-    fields verbatim so :func:`encode_task_handle` is a trivial
-    round-trip. ``parent_chain`` is a flat list of
-    ``{vendor, kind, native_id, origin_node_id}`` dicts in
-    root-to-immediate-parent order; treat it as opaque on the client
-    — the server is the only component that ever consumes it.
-    """
-
-    vendor: str
-    kind: str
-    native_id: str
-    origin_node_id: str
-    parent_chain: list[dict[str, str]] = field(default_factory=list)
-
-    def __str__(self) -> str:
-        # Workflow runtime sometimes coerces socket values to ``str``
-        # (UI previews, log lines). Surfacing the native id keeps that
-        # output human-meaningful without leaking the lineage chain
-        # into UI strings.
-        return self.native_id
-
-
-def _validate_task_handle_ref(ref: Any, *, context: str) -> dict[str, str]:
-    """Validate one ``{vendor, kind, native_id, origin_node_id}`` ref.
-
-    Mirror of the server-side ``_validate_task_handle_ref`` —
-    rejects malformed parent_chain entries with the same field-by-
-    field error messages so a bad envelope surfaces the same way on
-    both sides.
-    """
-    if not isinstance(ref, dict):
-        raise RnpProtocolError(
-            f"{context}: expected dict, got {type(ref).__name__}",
-            code=ErrorCode.INTERNAL,
-        )
-    out: dict[str, str] = {}
-    for fld in ("vendor", "kind", "native_id", "origin_node_id"):
-        val = ref.get(fld)
-        if not isinstance(val, str) or not val:
-            raise RnpProtocolError(
-                f"{context}: field {fld!r} must be a non-empty string "
-                f"(got {val!r})",
-                code=ErrorCode.INTERNAL,
-            )
-        out[fld] = val
-    if "," in out["kind"]:
-        raise RnpProtocolError(
-            f"{context}: 'kind' must be a singular socket kind, not a "
-            f"comma-union string (got {out['kind']!r})",
-            code=ErrorCode.INTERNAL,
-        )
-    return out
-
-
-def decode_task_handle_envelope(envelope: dict[str, Any]) -> TaskHandle:
-    """Decode a ``task_handle`` envelope into a :class:`TaskHandle`.
-
-    Only the ``vendor_inline`` encoding is recognised today (a future
-    sibling ``replay_ticket_inline`` would carry a signed server-
-    local replay token for cross-server portability — not in this
-    PR). All four top-level fields and every ``parent_chain`` entry
-    are validated; rejections raise ``RnpProtocolError(INTERNAL)``
-    with the same field-by-field messages the server emits at
-    envelope-build time.
-    """
-    encoding = envelope.get("encoding")
-    if encoding != "vendor_inline":
-        raise RnpProtocolError(
-            f"Unsupported task_handle encoding: {encoding!r}",
-            code=ErrorCode.INTERNAL,
-        )
-    top = _validate_task_handle_ref(
-        {
-            "vendor":         envelope.get("vendor"),
-            "kind":           envelope.get("kind"),
-            "native_id":      envelope.get("native_id"),
-            "origin_node_id": envelope.get("origin_node_id"),
-        },
-        context="task_handle",
-    )
-    chain_in = envelope.get("parent_chain", [])
-    if not isinstance(chain_in, list):
-        raise RnpProtocolError(
-            f"task_handle 'parent_chain' must be a list (got "
-            f"{type(chain_in).__name__})",
-            code=ErrorCode.INTERNAL,
-        )
-    chain_out = [
-        _validate_task_handle_ref(entry, context=f"parent_chain[{i}]")
-        for i, entry in enumerate(chain_in)
-    ]
-    return TaskHandle(
-        vendor=top["vendor"],
-        kind=top["kind"],
-        native_id=top["native_id"],
-        origin_node_id=top["origin_node_id"],
-        parent_chain=chain_out,
-    )
-
-
-def encode_task_handle(handle: TaskHandle) -> dict[str, Any]:
-    """Encode a :class:`TaskHandle` back into a wire-format envelope.
-
-    Symmetric counterpart of :func:`decode_task_handle_envelope` so a
-    handle decoded from one provider's output and fed into another
-    provider's input round-trips losslessly — the proxy_node calls
-    this whenever it sees a ``TaskHandle`` in the input values for a
-    descriptor that accepts the ``task_handle`` envelope type.
-
-    The returned dict is the same shape the server's
-    ``make_task_handle_envelope`` produces, so the server-side
-    decoder accepts it without any branching on "is this a fresh
-    handle or a re-encoded one" — the wire is the source of truth.
-    """
-    return {
-        "type":           "task_handle",
-        "encoding":       "vendor_inline",
-        "vendor":         handle.vendor,
-        "kind":           handle.kind,
-        "native_id":      handle.native_id,
-        "origin_node_id": handle.origin_node_id,
-        "parent_chain":   [dict(entry) for entry in handle.parent_chain],
-    }
-
-
-# ---------------------------------------------------------------------------
 # Dispatch by envelope type
 # ---------------------------------------------------------------------------
 
 _DECODERS = {
-    "image":       decode_image_envelope,
-    "mask":        decode_mask_envelope,
-    "audio":       decode_audio_envelope,
-    "video":       decode_video_envelope,
-    "model_3d":    decode_model3d_envelope,
-    "task_handle": decode_task_handle_envelope,
+    "image":    decode_image_envelope,
+    "mask":     decode_mask_envelope,
+    "audio":    decode_audio_envelope,
+    "video":    decode_video_envelope,
+    "model_3d": decode_model3d_envelope,
 }
 
 
@@ -1005,9 +856,6 @@ __all__ = [
     "decode_video_envelope",
     "decode_model3d_envelope",
     "_bundled_file3d_class",
-    "TaskHandle",
-    "decode_task_handle_envelope",
-    "encode_task_handle",
     "decode_envelope",
     "is_envelope",
     "is_image_tensor",

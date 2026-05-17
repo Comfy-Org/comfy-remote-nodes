@@ -225,61 +225,9 @@ class Capability:
     # ``uri`` per file for URL-fetch-out-of-band semantics; not in
     # this PR.
     MODEL_3D_BUNDLE_INLINE = "model_3d:bundle_inline"
-    # Cross-node task handle envelope: wraps a vendor-native task /
-    # video / job ID (Tripo MODEL_TASK_ID, Kling video_id, future
-    # partner handles) with enough lineage metadata to chain provider
-    # nodes (Tripo Texture/Refine/Rig/Retarget/Conversion, Kling
-    # VideoExtend, ...) across a single workflow graph. Wire shape:
-    #
-    #   {
-    #     "type":           "task_handle",
-    #     "encoding":       "vendor_inline",
-    #     "vendor":         "tripo",
-    #     "kind":           "MODEL_TASK_ID",
-    #     "native_id":      "abc123-tripo-uuid",
-    #     "origin_node_id": "42",
-    #     "parent_chain": [
-    #       {"vendor": "tripo", "kind": "MODEL_TASK_ID",
-    #        "native_id": "prev-uuid", "origin_node_id": "17"}
-    #     ]
-    #   }
-    #
-    # ``vendor`` is a lowercase provider slug. ``kind`` is the
-    # singular emitted socket kind string (``MODEL_TASK_ID`` /
-    # ``RIG_TASK_ID`` / ``RETARGET_TASK_ID`` / ``KLING_VIDEO_ID``) —
-    # NEVER the comma-union string that provider nodes use for input
-    # type-acceptance (e.g. ``TripoConversionNode`` accepts
-    # ``"MODEL_TASK_ID,RIG_TASK_ID,RETARGET_TASK_ID"``; the wire kind
-    # is whatever the upstream actually emitted). ``native_id`` is
-    # the vendor-native opaque string. ``origin_node_id`` is the
-    # upstream workflow node's unique id (log correlation + future
-    # replay).
-    #
-    # ``parent_chain`` is a FLAT list (not recursive nested
-    # envelopes) of ``{vendor, kind, native_id, origin_node_id}``
-    # refs in root-to-immediate-parent order. Each downstream node
-    # appends its parent's ref before the parent's chain is copied
-    # through; the chain captures the full lineage. Hard-capped at
-    # depth 32 server-side to prevent runaway growth.
-    #
-    # Negotiation: server emits ``task_handle`` envelopes only when
-    # the inbound request advertises this capability; legacy clients
-    # surface NEGOTIATION_FAILED at descriptor-load time on any
-    # provider that publishes a handle-typed output OR accepts one
-    # as input. Whole-descriptor gating — partial-socket synthesis
-    # is rejected because the chain breaks meaningfully if either
-    # end is missing.
-    #
-    # The client decoder returns a ``TaskHandle`` dataclass (NOT a
-    # plain string) so lineage metadata round-trips when the value
-    # is passed through to the next provider node — re-encoding the
-    # same dataclass on a downstream submit preserves ``parent_chain``
-    # without the proxy_node needing to know anything provider-
-    # specific.
-    IO_TASK_HANDLE = "io:task_handle"
 
 
-HEAVY_TYPES = frozenset({"image", "video", "audio", "mask", "model_3d", "task_handle"})
+HEAVY_TYPES = frozenset({"image", "video", "audio", "mask", "model_3d"})
 
 
 def is_envelope(value: Any) -> bool:
