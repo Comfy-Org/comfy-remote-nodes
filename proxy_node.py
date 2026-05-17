@@ -1698,6 +1698,8 @@ def _encode_one(
         return serialization.encode_audio_input(value)
     if serialization.is_video_input(value):
         return serialization.encode_video_input(value)
+    if serialization.is_model3d_input(value):
+        return serialization.encode_model3d_input(value)
     if not serialization._is_torch_tensor(value):
         return value
     rank = value.dim()

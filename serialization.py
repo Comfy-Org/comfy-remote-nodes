@@ -516,8 +516,68 @@ def decode_video_envelope(envelope: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# 3D model decode (encode lands when a remote node accepts MODEL_3D inputs)
+# 3D model encode / decode
 # ---------------------------------------------------------------------------
+
+def encode_model3d_input(model_3d: Any) -> dict[str, Any]:
+    """Encode a ComfyUI ``File3D`` (or compatible) as an inline
+    single-file 3D-model envelope.
+
+    Mirrors the AUDIO / VIDEO encoders above: reads the primary mesh
+    bytes (via the ``File3D`` API: ``get_data().read()`` returns a
+    ``BytesIO`` payload; falling back to ``read_bytes()`` for older
+    sources) and base64-encodes them. The envelope's ``encoding`` is
+    ``"glb_inline"`` (the generic single-file inline encoding the
+    server-side decoder dispatches on at :func:`decode_model3d_envelope`
+    — the decoder hands the bytes to ``File3D(BytesIO(...), format)``
+    regardless of whether the actual format is glb / obj / fbx / etc.,
+    so the ``encoding`` name is a logical "inline single-file 3D" tag
+    and the ``format`` extra picks the file extension).
+
+    Multi-file bundles (``BundledFile3D``-style values where every
+    companion file matters — e.g. an OBJ with a sibling .mtl + texture
+    PNGs) are not yet supported on the encode path: this PR ships the
+    minimal wire shape needed for the Tencent Hunyuan3D MODEL_3D-input
+    nodes which all upload a single file via ``upload_3d_model_to_comfyapi``
+    upstream. Bundle encode (``bundle_inline``) lands when a partner
+    node actually needs the companion bytes.
+    """
+    file_format = ""
+    fmt_attr = getattr(model_3d, "format", None)
+    if isinstance(fmt_attr, str):
+        file_format = fmt_attr.lower()
+
+    # ``File3D.get_data()`` returns a ``BytesIO`` (per
+    # ``comfy_api.latest._util.geometry_types.File3D``). Other File3D-
+    # compatible classes may instead expose ``read_bytes`` returning
+    # raw bytes; fall back to that for compatibility.
+    raw: bytes
+    get_data = getattr(model_3d, "get_data", None)
+    if callable(get_data):
+        buf = get_data()
+        if hasattr(buf, "seek"):
+            buf.seek(0)
+        raw = buf.read() if hasattr(buf, "read") else bytes(buf)
+    else:
+        read_bytes = getattr(model_3d, "read_bytes", None)
+        if callable(read_bytes):
+            raw = read_bytes()
+        else:
+            raise RnpProtocolError(
+                f"unsupported 3D model value: {type(model_3d).__name__!r} "
+                f"has no get_data() or read_bytes()",
+                code=ErrorCode.INTERNAL,
+            )
+
+    envelope: dict[str, Any] = {
+        "type":     "model_3d",
+        "encoding": "glb_inline",
+        "data":     base64.b64encode(raw).decode("ascii"),
+    }
+    if file_format:
+        envelope["format"] = file_format
+    return envelope
+
 
 # ---------------------------------------------------------------------------
 # Multi-file 3D bundle: a ``File3D``-compatible class that carries the
@@ -890,6 +950,29 @@ def is_video_input(value: Any) -> bool:
     )
 
 
+def is_model3d_input(value: Any) -> bool:
+    """Best-effort check for a ComfyUI ``File3D`` (or compatible).
+
+    Duck-types on the ``format`` string attribute + ``get_data``
+    callable: both are present on the ``File3D`` class in
+    ``comfy_api.latest._util.geometry_types`` and the
+    ``BundledFile3D`` subclass built lazily in
+    :func:`_bundled_file3d_class`. Avoids importing ``File3D`` at
+    module load (which would pull torch via the ``comfy_api`` tree).
+
+    The ``VideoInput`` shape (``save_to`` + ``get_duration``) does not
+    expose a ``format`` string property, so VIDEO and MODEL_3D values
+    don't collide; caller (:func:`_encode_one`) still dispatches
+    AUDIO / VIDEO before MODEL_3D as defense-in-depth.
+    """
+    if isinstance(value, dict):
+        return False
+    return (
+        isinstance(getattr(value, "format", None), str)
+        and callable(getattr(value, "get_data", None))
+    )
+
+
 def _is_torch_tensor(value: Any) -> bool:
     try:
         import torch
@@ -908,6 +991,7 @@ __all__ = [
     "decode_audio_envelope",
     "encode_video_input",
     "decode_video_envelope",
+    "encode_model3d_input",
     "decode_model3d_envelope",
     "_bundled_file3d_class",
     "decode_envelope",
@@ -916,4 +1000,5 @@ __all__ = [
     "is_mask_tensor",
     "is_audio_input",
     "is_video_input",
+    "is_model3d_input",
 ]
