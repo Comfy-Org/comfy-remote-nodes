@@ -1546,6 +1546,8 @@ async def _encode_inputs(
     * ``torch.Tensor`` rank 3 with last-dim != 3/4 → mask envelope (B,H,W).
       Rank-2 (H,W) tensors are also treated as masks.
     * ``dict`` with ``waveform`` + ``sample_rate`` → audio envelope.
+    * ``VideoInput`` subclass (duck-typed via ``save_to`` +
+      ``get_duration``) → mp4-base64 video envelope.
     * Everything else passes through as-is (already JSON-serializable).
 
     When ``max_inline_bytes`` is set, any envelope whose inline payload
@@ -1694,6 +1696,8 @@ def _encode_one(
 ) -> Any:
     if serialization.is_audio_input(value):
         return serialization.encode_audio_input(value)
+    if serialization.is_video_input(value):
+        return serialization.encode_video_input(value)
     if not serialization._is_torch_tensor(value):
         return value
     rank = value.dim()
