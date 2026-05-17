@@ -465,8 +465,43 @@ def decode_audio_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Video decode (encode lands when a remote node accepts VIDEO inputs)
+# Video encode / decode
 # ---------------------------------------------------------------------------
+
+def encode_video_input(video: Any) -> dict[str, Any]:
+    """Encode a ComfyUI VIDEO (``VideoInput`` subclass) as an mp4-base64
+    video envelope.
+
+    Mirrors the AUDIO encoder above: re-encodes the Video object to an
+    in-memory mp4/H.264 byte buffer (matches upstream
+    ``comfy_api_nodes/util/conversions.py`` ``video_to_base64_string``)
+    and base64-encodes it. Populates ``duration_s`` metadata when the
+    Video object exposes ``get_duration()`` so server-side providers
+    (e.g. ``GrokVideoExtendProvider._validate_video_duration_envelope``)
+    can range-check without demuxing the MP4.
+    """
+    from comfy_api_nodes.util.conversions import video_to_base64_string
+
+    b64 = video_to_base64_string(video)
+    extra: dict[str, Any] = {}
+    duration_s: float | None = None
+    try:
+        getter = getattr(video, "get_duration", None)
+        if callable(getter):
+            d = getter()
+            if d is not None:
+                duration_s = float(d)
+    except Exception:
+        duration_s = None
+    if duration_s is not None:
+        extra["duration_s"] = duration_s
+    return {
+        "type":     "video",
+        "encoding": "mp4_base64",
+        "data":     b64,
+        **extra,
+    }
+
 
 def decode_video_envelope(envelope: dict[str, Any]) -> Any:
     """Decode a video envelope into a ComfyUI Video object (mp4 inline)."""
@@ -837,6 +872,24 @@ def is_audio_input(value: Any) -> bool:
     )
 
 
+def is_video_input(value: Any) -> bool:
+    """Best-effort check for a ComfyUI ``VideoInput`` subclass.
+
+    Duck-types on the ``save_to`` + ``get_duration`` method pair: both
+    are defined on the ``VideoInput`` abstract base in
+    ``comfy_api.latest._input`` and present on every concrete subclass
+    (``VideoFromFile`` / ``VideoFromComponents``). Avoids importing
+    ``VideoInput`` at module load (which would pull torch via the
+    ``comfy_api`` tree).
+    """
+    if isinstance(value, dict):
+        return False
+    return (
+        callable(getattr(value, "save_to", None))
+        and callable(getattr(value, "get_duration", None))
+    )
+
+
 def _is_torch_tensor(value: Any) -> bool:
     try:
         import torch
@@ -853,6 +906,7 @@ __all__ = [
     "decode_mask_envelope",
     "encode_audio_input",
     "decode_audio_envelope",
+    "encode_video_input",
     "decode_video_envelope",
     "decode_model3d_envelope",
     "_bundled_file3d_class",
@@ -861,4 +915,5 @@ __all__ = [
     "is_image_tensor",
     "is_mask_tensor",
     "is_audio_input",
+    "is_video_input",
 ]
