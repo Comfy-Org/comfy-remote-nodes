@@ -484,27 +484,315 @@ def decode_video_envelope(envelope: dict[str, Any]) -> Any:
 # 3D model decode (encode lands when a remote node accepts MODEL_3D inputs)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Multi-file 3D bundle: a ``File3D``-compatible class that carries the
+# primary mesh plus N companion files (textures / .mtl / .bin / etc.).
+#
+# Built lazily as a ``File3D`` subclass on first use — importing
+# ``File3D`` at module load pulls torch (via ``comfy_api.latest._util.
+# geometry_types``), which is fine inside ComfyUI but breaks the
+# smoke-test pattern that exercises serialization without the heavy
+# comfy_api tree. The factory below caches the constructed class so
+# every ``BundledFile3D`` instance shares the same dynamic class and
+# ``isinstance(x, File3D)`` always succeeds.
+# ---------------------------------------------------------------------------
+
+_BUNDLED_FILE3D_CLS: Any = None
+
+
+def _bundled_file3d_class() -> type:
+    """Return the cached ``BundledFile3D`` class (a ``File3D`` subclass).
+
+    Constructs it on first call so the ``comfy_api.latest._util``
+    import (which pulls torch) is paid for only when a bundle
+    envelope is actually decoded — keeps the smoke-test stubbing
+    pattern intact for callers that don't exercise this path.
+    """
+    global _BUNDLED_FILE3D_CLS
+    if _BUNDLED_FILE3D_CLS is not None:
+        return _BUNDLED_FILE3D_CLS
+    from comfy_api.latest._util.geometry_types import File3D as _File3D
+
+    class BundledFile3D(_File3D):
+        """``File3D``-compatible wrapper for a multi-file 3D bundle.
+
+        Stores the primary mesh file plus N companion files (textures
+        / .mtl / .bin / etc.) in memory as a ``path -> bytes`` dict;
+        lazily materialises the whole bundle into a temp directory the
+        first time anything cross-file-resolution-sensitive is asked
+        of it (``get_source()`` for an OBJ/GLTF that needs its
+        .mtl/.bin/textures on disk; ``save_to(dest)`` which copies the
+        *whole bundle* into the destination directory).
+
+        Cheap consumers that just want the primary file's bytes
+        (``get_data()`` / ``get_bytes()``) skip the temp-dir
+        materialise entirely.
+
+        The temp directory's lifetime is tied to this object: it is
+        cleaned up on garbage-collect via ``__del__`` (best-effort).
+        For workflows that need stable on-disk paths beyond this
+        object's lifetime, call ``save_to(dest)`` to copy the bundle
+        into a caller-controlled location.
+        """
+
+        def __init__(
+            self,
+            files: dict[str, bytes],
+            primary_path: str,
+            roles: dict[str, str] | None = None,
+            formats: dict[str, str] | None = None,
+        ) -> None:
+            if primary_path not in files:
+                raise ValueError(
+                    f"primary_path {primary_path!r} not in bundle files: "
+                    f"{sorted(files)!r}"
+                )
+            self._files: dict[str, bytes] = dict(files)
+            self._primary_path = primary_path
+            self._roles: dict[str, str] = dict(roles or {})
+            self._formats: dict[str, str] = dict(formats or {})
+            self._temp_dir: str | None = None
+            # Populate parent ``_source`` / ``_format`` so reads of
+            # those plain attributes on downstream consumers that
+            # haven't been updated still work. ``_source`` is a
+            # BytesIO of the primary file; ``_format`` is the primary
+            # file's extension.
+            primary_fmt = (
+                self._formats.get(primary_path)
+                or (
+                    primary_path.rsplit(".", 1)[-1].lower()
+                    if "." in primary_path
+                    else ""
+                )
+            )
+            super().__init__(BytesIO(self._files[primary_path]), primary_fmt)
+
+        # --------------------------------------------------------------
+        # File3D-compatible accessors (overrides)
+        # --------------------------------------------------------------
+
+        def get_source(self) -> str:
+            """Return the on-disk path to the primary file.
+
+            Materialises the whole bundle into a temp directory on
+            first call so cross-file refs (.obj -> .mtl -> texture;
+            .gltf -> .bin + textures) resolve via the filesystem.
+            """
+            self._ensure_materialized()
+            from os.path import join as _join
+            return _join(self._temp_dir, *self._primary_path.split("/"))
+
+        def get_data(self) -> BytesIO:
+            """Return the primary file's bytes (no disk I/O)."""
+            return BytesIO(self._files[self._primary_path])
+
+        def get_bytes(self) -> bytes:
+            """Return the primary file's raw bytes (no disk I/O)."""
+            return self._files[self._primary_path]
+
+        def save_to(self, path: str) -> str:
+            """Copy the WHOLE bundle into the destination directory.
+
+            ``path`` is the destination for the *primary file*;
+            sidecars are copied alongside it preserving their relative
+            paths from the original bundle layout. E.g. for
+
+                primary_path = "model.obj"
+                files = {
+                    "model.obj":            <bytes>,
+                    "model.mtl":            <bytes>,
+                    "textures/albedo.png":  <bytes>,
+                }
+
+            ``save_to("/tmp/out/scene.obj")`` writes:
+
+                /tmp/out/scene.obj
+                /tmp/out/model.mtl
+                /tmp/out/textures/albedo.png
+
+            Sidecars keep their ORIGINAL filenames (so cross-file
+            refs inside the .obj that point at ``model.mtl`` still
+            resolve); only the primary file is renamed to match
+            ``path``. The destination directory is created if needed.
+            """
+            from pathlib import Path
+            dest = Path(path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(self._files[self._primary_path])
+            dest_parent_resolved = dest.parent.resolve()
+            for rel_path, raw in self._files.items():
+                if rel_path == self._primary_path:
+                    continue
+                sidecar_dest = dest.parent.joinpath(*rel_path.split("/"))
+                # Path safety — rel_path was sanitized at envelope
+                # build time, but defence-in-depth check on the
+                # resolved path keeps us safe against pathological
+                # inputs that may have slipped through.
+                resolved = sidecar_dest.resolve()
+                if dest_parent_resolved not in resolved.parents and resolved != dest_parent_resolved:
+                    continue
+                sidecar_dest.parent.mkdir(parents=True, exist_ok=True)
+                sidecar_dest.write_bytes(raw)
+            return str(dest)
+
+        # --------------------------------------------------------------
+        # Bundle-specific accessors (additive)
+        # --------------------------------------------------------------
+
+        @property
+        def primary_path(self) -> str:
+            return self._primary_path
+
+        @property
+        def file_paths(self) -> list[str]:
+            return sorted(self._files)
+
+        def file_bytes(self, path: str) -> bytes:
+            """Raw bytes for one file in the bundle by relative path."""
+            return self._files[path]
+
+        def file_role(self, path: str) -> str | None:
+            """Optional producer-supplied role hint (may be ``None``)."""
+            return self._roles.get(path)
+
+        def paths_with_role(self, role: str) -> list[str]:
+            """All file paths whose role hint equals ``role``."""
+            return [p for p, r in self._roles.items() if r == role]
+
+        def materialize_to_temp_dir(self) -> str:
+            """Force-materialise the whole bundle into a temp directory.
+
+            Returns the temp-directory path. Cleanup happens on GC;
+            callers that need stable lifetimes should ``save_to()`` to
+            a caller-controlled location instead.
+            """
+            self._ensure_materialized()
+            return self._temp_dir
+
+        # --------------------------------------------------------------
+        # Internal
+        # --------------------------------------------------------------
+
+        def _ensure_materialized(self) -> None:
+            if self._temp_dir is not None:
+                return
+            import tempfile
+            from pathlib import Path
+            self._temp_dir = tempfile.mkdtemp(prefix="rnp_model3d_bundle_")
+            root = Path(self._temp_dir)
+            for rel_path, raw in self._files.items():
+                # rel_path was sanitized at envelope build time —
+                # split-on-'/' and re-join via Path is safe.
+                dest = root.joinpath(*rel_path.split("/"))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(raw)
+
+        def __del__(self) -> None:
+            td = getattr(self, "_temp_dir", None)
+            if td is not None:
+                try:
+                    import shutil
+                    shutil.rmtree(td, ignore_errors=True)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def __repr__(self) -> str:
+            return (
+                f"BundledFile3D(primary={self._primary_path!r}, "
+                f"files={len(self._files)}, format={self._format!r})"
+            )
+
+    _BUNDLED_FILE3D_CLS = BundledFile3D
+    return _BUNDLED_FILE3D_CLS
+
+
 def decode_model3d_envelope(envelope: dict[str, Any]) -> Any:
     """Decode a 3D-model envelope into a ComfyUI ``File3D`` object.
 
-    Mirrors :func:`decode_video_envelope`: the only currently supported
-    encoding is ``glb_inline`` (binary glTF 2.0 — magic ``b"glTF"`` at
-    offset 0). The bytes are handed to ``File3D`` as a ``BytesIO`` so
-    downstream nodes (preview3d / SaveGLB / Load3D) see exactly the
-    same value shape they would from a local Tripo / Rodin / Meshy
-    node. The envelope's optional ``format`` extra is forwarded as the
-    second constructor arg so the materialiser picks the right file
-    extension when persisting.
+    Dispatches on the envelope's ``encoding``:
+
+    * ``glb_inline`` — single-file binary glTF 2.0 (magic ``b"glTF"``
+      at offset 0). The bytes are handed to ``File3D`` as a
+      ``BytesIO`` so downstream nodes (preview3d / SaveGLB / Load3D)
+      see exactly the same value shape they would from a local Tripo
+      / Rodin / Meshy node. The envelope's optional ``format`` extra
+      is forwarded as the second constructor arg so the materialiser
+      picks the right file extension when persisting.
+
+    * ``bundle_inline`` — multi-file bundle. The primary mesh file
+      plus N companion files (textures / .mtl / .bin / etc.) are
+      decoded into a :class:`BundledFile3D` (``File3D``-compatible)
+      whose ``get_source()`` / ``save_to()`` materialise the whole
+      bundle on disk so cross-file refs resolve via the filesystem.
+      Path safety (no ``..`` / no absolute prefix / no Windows drive
+      letter / no case-insensitive collisions) was enforced at
+      envelope build time on the server; the client re-asserts the
+      ``primary_path``-present invariant defensively and rejects any
+      file entry that lacks ``data``.
     """
     encoding = envelope.get("encoding")
-    if encoding != "glb_inline":
-        raise RnpProtocolError(
-            f"Unsupported model_3d encoding: {encoding!r}",
-            code=ErrorCode.INTERNAL,
+    if encoding == "glb_inline":
+        from comfy_api.latest._util import File3D
+        file_format = envelope.get("format") or "glb"
+        return File3D(BytesIO(decode_envelope_data(envelope)), str(file_format))
+    if encoding == "bundle_inline":
+        bundle_cls = _bundled_file3d_class()
+        primary_path = envelope.get("primary_path")
+        if not isinstance(primary_path, str) or not primary_path:
+            raise RnpProtocolError(
+                "bundle_inline envelope missing 'primary_path'",
+                code=ErrorCode.INTERNAL,
+            )
+        files_spec = envelope.get("files")
+        if not isinstance(files_spec, list) or not files_spec:
+            raise RnpProtocolError(
+                "bundle_inline envelope missing non-empty 'files' list",
+                code=ErrorCode.INTERNAL,
+            )
+        files: dict[str, bytes] = {}
+        roles: dict[str, str] = {}
+        formats: dict[str, str] = {}
+        for entry in files_spec:
+            if not isinstance(entry, dict):
+                raise RnpProtocolError(
+                    f"bundle_inline file entry not a dict: {entry!r}",
+                    code=ErrorCode.INTERNAL,
+                )
+            path = entry.get("path")
+            if not isinstance(path, str) or not path:
+                raise RnpProtocolError(
+                    f"bundle_inline file entry missing 'path': {entry!r}",
+                    code=ErrorCode.INTERNAL,
+                )
+            data = entry.get("data")
+            if not isinstance(data, str):
+                raise RnpProtocolError(
+                    f"bundle_inline file {path!r} missing inline 'data'",
+                    code=ErrorCode.INTERNAL,
+                )
+            files[path] = base64.b64decode(data)
+            role = entry.get("role")
+            if isinstance(role, str):
+                roles[path] = role
+            fmt = entry.get("format")
+            if isinstance(fmt, str):
+                formats[path] = fmt
+        if primary_path not in files:
+            raise RnpProtocolError(
+                f"bundle_inline primary_path {primary_path!r} not in "
+                f"files list (have: {sorted(files)!r})",
+                code=ErrorCode.INTERNAL,
+            )
+        return bundle_cls(
+            files=files,
+            primary_path=primary_path,
+            roles=roles,
+            formats=formats,
         )
-    from comfy_api.latest._util import File3D
-    file_format = envelope.get("format") or "glb"
-    return File3D(BytesIO(decode_envelope_data(envelope)), str(file_format))
+    raise RnpProtocolError(
+        f"Unsupported model_3d encoding: {encoding!r}",
+        code=ErrorCode.INTERNAL,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +855,7 @@ __all__ = [
     "decode_audio_envelope",
     "decode_video_envelope",
     "decode_model3d_envelope",
+    "_bundled_file3d_class",
     "decode_envelope",
     "is_envelope",
     "is_image_tensor",

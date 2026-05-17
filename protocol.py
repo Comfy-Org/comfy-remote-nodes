@@ -164,6 +164,67 @@ class Capability:
     # parse — the magic-byte check at offset 0 is the only validity
     # guard the server applies).
     MODEL_3D_GLB_INLINE = "model_3d:glb_inline"
+    # 3D MODEL BUNDLE envelope: a primary mesh file plus N companion
+    # files (textures / .mtl / .bin / other PBR maps) carried inline as
+    # a single coherent unit. Wire shape:
+    #
+    #   {
+    #     "type":         "model_3d",
+    #     "encoding":     "bundle_inline",
+    #     "format":       "obj",
+    #     "primary_path": "model.obj",
+    #     "files": [
+    #       {"path": "model.obj",            "format": "obj", "role": "mesh",
+    #        "data": "<b64>", "byte_size": 12345},
+    #       {"path": "model.mtl",            "format": "mtl", "role": "material",
+    #        "data": "<b64>"},
+    #       {"path": "textures/albedo.png",  "format": "png", "role": "texture_diffuse",
+    #        "data": "<b64>"}
+    #     ]
+    #   }
+    #
+    # ``path`` is the authoritative cross-file reference key — a POSIX-
+    # relative path (no ``..``, no absolute prefix, no Windows drive
+    # letter, no backslashes, no case-insensitive collisions). The
+    # client decoder materialises files into a temp directory using
+    # exactly these paths so a ``.obj`` that references its ``.mtl``
+    # via filename (or a ``.gltf`` that references its ``.bin`` /
+    # textures via relative URI) resolves on disk.
+    #
+    # ``role`` is an OPTIONAL producer hint (NOT a closed enum) —
+    # well-known values include ``mesh``, ``material``, ``buffer``,
+    # ``texture_diffuse``, ``texture_metallic``, ``texture_normal``,
+    # ``texture_roughness``, ``texture_ao``, ``texture_emissive``,
+    # ``texture_height``. Unknown roles round-trip without error;
+    # consumers may use ``role`` for convenience but ``path`` is the
+    # primary identifier.
+    #
+    # ``primary_path`` MUST appear in ``files`` exactly once and pins
+    # the entry-point file (the one passed to ComfyUI's
+    # ``Types.File3D`` constructor by the client decoder). The
+    # top-level ``format`` (if set) MUST match that primary file's
+    # ``format``.
+    #
+    # The client decoder returns a ``BundledFile3D`` (a thin
+    # ``File3D``-compatible wrapper) — existing downstream loaders
+    # that call ``get_source()`` / ``get_data()`` / ``save_to()`` get
+    # the bundle's primary file with all sidecars materialised on
+    # disk first so cross-file refs resolve correctly. Override of
+    # ``save_to()`` copies the *whole bundle* into the destination
+    # directory, not just the primary file.
+    #
+    # Negotiation: the server emits this encoding ONLY when the
+    # inbound request advertised this token; legacy clients without
+    # the bundle decoder will surface NEGOTIATION_FAILED at
+    # descriptor-load time. Whole-descriptor gating — if a node has
+    # both bundle and non-bundle outputs and the cap is absent, the
+    # whole descriptor is skipped rather than synthesising a
+    # partial-socket variant.
+    #
+    # A future sibling ``Capability.MODEL_3D_BUNDLE_URI`` would carry
+    # ``uri`` per file for URL-fetch-out-of-band semantics; not in
+    # this PR.
+    MODEL_3D_BUNDLE_INLINE = "model_3d:bundle_inline"
 
 
 HEAVY_TYPES = frozenset({"image", "video", "audio", "mask", "model_3d"})
